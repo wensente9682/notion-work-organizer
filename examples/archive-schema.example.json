@@ -1,0 +1,22 @@
+{
+  "description": "Minimal archive table schema. Archive rows copy only reviewed knowledge fields.",
+  "database": "archive",
+  "properties": {
+    "Task": {
+      "type": "title",
+      "workflow_field": "task",
+      "required": true
+    },
+    "Takeaway": {
+      "type": "rich_text",
+      "workflow_field": "takeaway",
+      "required": true
+    },
+    "Improvement": {
+      "type": "rich_text",
+      "workflow_field": "improvement",
+      "required": true
+    }
+  },
+  "do_not_copy_from_source": ["Done", "Category"]
+}

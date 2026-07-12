@@ -1,0 +1,18 @@
+{
+  "source_database_id": "YOUR_TODO_SOURCE_DATABASE_ID",
+  "ledger_database_id": "YOUR_OPTIONAL_TEST_LEDGER_DATABASE_ID",
+  "source_order": "bottom_first",
+  "batch_size": 5,
+  "move_limit": 30,
+  "field_mapping": {
+    "task": "Task",
+    "done": "Done",
+    "category": "Category",
+    "takeaway": "Takeaway",
+    "improvement": "Improvement"
+  },
+  "target_databases": {
+    "example-category": "YOUR_EXAMPLE_CATEGORY_ARCHIVE_DATABASE_ID",
+    "another-category": "YOUR_ANOTHER_CATEGORY_ARCHIVE_DATABASE_ID"
+  }
+}

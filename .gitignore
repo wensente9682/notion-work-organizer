@@ -1,0 +1,15 @@
+.todo_archive/
+
+# Local development-only instructions and tools.
+.agents/
+AGENTS.md
+codex-maintenance/
+
+# Local/private Notion profiles. Commit sanitized *.example.json templates instead.
+config.test.json
+config.local.json
+*.local.json
+
+__pycache__/
+*.pyc
+.DS_Store

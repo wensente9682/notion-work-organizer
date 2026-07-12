@@ -1,0 +1,37 @@
+{
+  "description": "Minimal source database schema for a portable Notion todo organize workflow.",
+  "database": "source",
+  "properties": {
+    "Task": {
+      "type": "title",
+      "workflow_field": "task",
+      "required": true
+    },
+    "Done": {
+      "type": "checkbox",
+      "workflow_field": "done",
+      "required": true
+    },
+    "Category": {
+      "type": "select",
+      "workflow_field": "category",
+      "required": true,
+      "example_options": ["research", "writing", "admin"]
+    },
+    "Takeaway": {
+      "type": "rich_text",
+      "workflow_field": "takeaway",
+      "required": true
+    },
+    "Improvement": {
+      "type": "rich_text",
+      "workflow_field": "improvement",
+      "required": true
+    }
+  },
+  "optional_properties": {
+    "Due": {"type": "date"},
+    "Priority": {"type": "select"},
+    "Tags": {"type": "multi_select"}
+  }
+}

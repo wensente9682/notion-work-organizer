@@ -1,0 +1,23 @@
+{
+  "mode": "real",
+  "source_database_id": "YOUR_REAL_TODO_SOURCE_DATABASE_ID",
+  "archive_tables_page_id": "YOUR_ARCHIVE_TABLES_PAGE_ID",
+  "source_order": "bottom_first",
+  "batch_size": 5,
+  "move_limit": 30,
+  "field_mapping": {
+    "task": "Task",
+    "done": "Done",
+    "category": "Category",
+    "takeaway": "Takeaway",
+    "improvement": "Improvement"
+  },
+  "archive_tables": {
+    "example-category": "example-category",
+    "another-category": "another-category"
+  },
+  "project_categories": {
+    "example-category": "YOUR_EXAMPLE_CATEGORY_PROJECT_PAGE_ID",
+    "another-category": "YOUR_ANOTHER_CATEGORY_PROJECT_PAGE_ID"
+  }
+}

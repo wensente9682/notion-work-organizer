@@ -1,0 +1,15 @@
+{
+  "description": "Example category-to-archive mapping using neutral categories and placeholder database IDs.",
+  "field_mapping": {
+    "task": "Task",
+    "done": "Done",
+    "category": "Category",
+    "takeaway": "Takeaway",
+    "improvement": "Improvement"
+  },
+  "target_databases": {
+    "research": "YOUR_RESEARCH_ARCHIVE_DATABASE_ID",
+    "writing": "YOUR_WRITING_ARCHIVE_DATABASE_ID",
+    "admin": "YOUR_ADMIN_ARCHIVE_DATABASE_ID"
+  }
+}
