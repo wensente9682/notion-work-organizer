@@ -1,16 +1,66 @@
 # Notion Daily Work Tracker for Codex
 
-A starter kit for building and maintaining a personal Notion system that
-captures and tracks daily work.
+An open-source starter kit for building a lightweight Notion daily work
+tracker—capture tasks, complete work, and organize finished items into reusable
+records.
 
-Use it to establish a new work to-do list or adapt an existing one, keep a
-continuous record of active and completed work, and review what you have done
-over time. Its differentiated post-completion workflow adds reflection,
-organization, archiving, and confirmation-based cleanup without turning those
-features into the whole product.
+[**Try it with your Notion list →**](#quick-start)
 
-The project is designed for Codex users first: Codex uses the Notion connector,
+![Workflow overview: capture, track, complete, reflect, organize, and archive daily work](docs/workflow-overview.svg)
+
+_A workflow overview of the current Codex + Notion experience; this project does
+not ship a separate GUI._
+
+## Why Use It
+
+- **Track daily work without maintaining a complex project-management system.**
+  Keep the portable schema small while preserving your own optional fields.
+- **Keep completed tasks instead of losing them.** Finished work stays available
+  for review before any cleanup decision.
+- **Turn daily activity into organized records for review and reflection.** Add
+  takeaways and improvements, then archive useful records by category.
+
+The project is designed for Codex users first. Codex uses the Notion connector,
 not a checked-in Notion token.
+
+## Quick Start
+
+Prerequisites: Git, Codex, and access to the Notion connector.
+
+1. Clone the repository and copy the skill into Codex's default personal skill
+   directory:
+
+   ```sh
+   git clone https://github.com/wensente9682/notion-work-organizer.git
+   cd notion-work-organizer
+   mkdir -p ~/.agents/skills
+   cp -R skills/todo-archive-review ~/.agents/skills/
+   ```
+
+2. Start a new Codex task and enable the Notion connector with access only to the
+   Notion databases you want this workflow to use.
+3. Choose the prompt that matches your starting point:
+
+   ```text
+   Use this workflow with my existing Notion to-do list. Start read-only.
+   ```
+
+   ```text
+   Set up a new Notion daily work tracker. Start with a plan only.
+   ```
+
+   Already configured? Start a review with:
+
+   ```text
+   organize todo
+   ```
+
+4. Review the proposed field mapping and read-only preview. Approve each Notion
+   write separately; final source cleanup has its own `done` → `confirm` gate.
+
+For normal Codex use, do not paste a Notion token into chat or add one to project
+config. See a sanitized review in
+[examples/session-output.example.txt](examples/session-output.example.txt).
 
 ## What This Is
 
@@ -53,7 +103,7 @@ ordinary Codex use.
 - Local runtime files such as `.todo_archive/`, `config.test.json`, and
   `*.local.json` are private and ignored.
 
-## How The Workflow Works
+## Workflow Details
 
 ### Capture
 
@@ -120,31 +170,6 @@ archive rows; dismissed rows are not archived and are verified against their
 source snapshot before removal. Removal means setting the source page to
 Notion's recoverable archived state so it leaves the active source table; it is
 not a permanent destroy operation.
-
-## Quickstart For Codex Users
-
-1. Install or expose the `todo-archive-review` skill in Codex.
-2. Make sure Codex has access to the Notion connector.
-3. Choose one path:
-   - Adopt an existing Notion list.
-   - Set up a new Notion system.
-   - Continue an existing organize workflow.
-4. Ask Codex in natural language, for example:
-
-```text
-Use this workflow with my existing Notion to-do list.
-```
-
-```text
-Set up a new Notion personal work maintenance system.
-```
-
-```text
-organize todo
-```
-
-For normal Codex use, do not paste a Notion token into chat and do not add a
-token to project config.
 
 ## Existing Notion List Path
 
@@ -320,7 +345,7 @@ python3 notion_todo_workflow.py undo 1
 python3 notion_todo_workflow.py --config .todo_archive/real_profile.json preview
 ```
 
-Local-only setup/adopt preflight for v0.2-alpha experiments:
+Local-only setup/adopt preflight:
 
 ```sh
 python3 setup_preflight.py --config config.example.json
@@ -351,6 +376,5 @@ python3 notion_todo_workflow.py remove-sources --confirm REMOVE_SOURCES
 - It does not expose or commit private configs, real database IDs, tokens,
   `.todo_archive/`, or maintainer-only profiles.
 
-Future work can add automatic schema checks or config generation as a guarded
-v0.2-alpha feature, but v0.1 intentionally keeps setup/adopt workflows
-read-only by default.
+Future versions may add more setup automation, but v0.1 intentionally keeps
+setup/adopt workflows read-only by default.
