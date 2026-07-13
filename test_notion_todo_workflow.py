@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 import uuid
@@ -338,6 +339,29 @@ class FieldMappingTest(unittest.TestCase):
 
 
 
+class PrivateJsonPermissionsTest(unittest.TestCase):
+    def test_save_json_creates_and_tightens_private_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / ".todo_archive"
+            path = runtime_dir / "state.json"
+            old_umask = os.umask(0o022)
+            try:
+                workflow.save_json(path, {"private": "value"})
+            finally:
+                os.umask(old_umask)
+
+            self.assertEqual(runtime_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(workflow.load_json(path, {}), {"private": "value"})
+
+            runtime_dir.chmod(0o755)
+            path.chmod(0o644)
+            workflow.save_json(path, {"private": "updated"})
+            self.assertEqual(runtime_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(workflow.load_json(path, {}), {"private": "updated"})
+
+
 class AutoContinueActiveBatchTest(unittest.TestCase):
     def test_next_reuses_active_batch_without_config_or_notion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -549,7 +573,7 @@ class CacheAndCooldownTest(unittest.TestCase):
 
 
 class BatchSelectionTest(unittest.TestCase):
-    def test_checked_empty_rows_are_removed_in_order_without_counting_toward_batch(self):
+    def test_checked_empty_rows_are_pending_in_order_without_counting_toward_batch(self):
         first_empty = source_row("empty-first", name="empty first")
         eligible = source_row("eligible-one", name="eligible", learnings="learned")
         later_empty = source_row("empty-later", name="empty later")
@@ -574,10 +598,10 @@ class BatchSelectionTest(unittest.TestCase):
             batch = workflow.make_batch(config(), state, 1)
 
         self.assertEqual([item.name for item in batch], ["eligible"])
-        self.assertEqual(client.archive_calls, ["empty-first"])
-        self.assertEqual(len(state["empty_removed"]), 1)
-        self.assertEqual(state["empty_removed"][0]["name_hint"], "empty first")
-        self.assertEqual(state["_empty_removed_this_batch"][0]["batch"], 3)
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(len(state["empty_cleanup"]), 1)
+        self.assertEqual(state["empty_cleanup"][0]["name_hint"], "empty first")
+        self.assertEqual(state["_empty_cleanup_this_batch"][0]["batch"], 3)
         backup.assert_called_once()
 
     def test_make_batch_continues_to_next_source_page_after_empty_rows(self):
@@ -606,7 +630,7 @@ class BatchSelectionTest(unittest.TestCase):
             batch = workflow.make_batch(config(), state, 1)
 
         self.assertEqual([item.name for item in batch], ["eligible page two"])
-        self.assertEqual(client.archive_calls, ["empty-page-one"])
+        self.assertEqual(client.archive_calls, [])
         self.assertEqual(client.source_queries, 2)
 
     def test_make_batch_records_manual_match_without_candidate_or_duplicate_copy(self):
@@ -1577,6 +1601,25 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
 
         self.assertEqual(client.archive_calls, [])
 
+    def test_remove_sources_rejects_empty_cleanup_without_done_confirm_path(self):
+        client = FakeClient([])
+        state = {"empty_cleanup": [{}], "moved": [], "skipped": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.json"
+            state_path = tmp_path / "state.json"
+            self.write_json(config_path, config())
+            self.write_json(state_path, state)
+            args = argparse.Namespace(config=config_path, state=state_path, confirm="REMOVE_SOURCES")
+
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                self.assertRaisesRegex(workflow.WorkflowError, "normal `done` -> `confirm` cleanup path"),
+            ):
+                workflow.command_remove_sources(args)
+
+        self.assertEqual(client.archive_calls, [])
+
     def test_confirm_keeps_dismissed_source_when_content_changed(self):
         class ChangedSourceClient(FakeClient):
             def retrieve_page(self, page_id):
@@ -1605,6 +1648,53 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(client.ledger_updates, [])
         self.assertTrue(updated["awaiting_done_confirm"])
         self.assertEqual(len(updated["moved"]), 1)
+
+    def test_empty_cleanup_waits_for_done_then_confirm(self):
+        candidate = workflow.Candidate.from_notion_page(page(SOURCE_ID, SOURCE_DB))
+        record = {
+            "action": "empty-pending-cleanup",
+            "status": "pending-removal",
+            "batch": 1,
+            "session_id": "session-1",
+            "operation_id": "empty-op",
+            "category": "alpha",
+            "name_hint": candidate.name,
+            "source_page_id": SOURCE_ID,
+            "source_url": candidate.source_url,
+            "fingerprint": workflow.candidate_fingerprint(candidate),
+        }
+        client = FakeClient([])
+
+        done_state = self.run_with_files(client, {"empty_cleanup": [record]}, workflow.command_done)
+        self.assertEqual(client.archive_calls, [])
+        self.assertTrue(done_state["awaiting_done_confirm"])
+
+        confirmed = self.run_with_files(client, done_state, workflow.command_confirm)
+        self.assertEqual(client.archive_calls, [SOURCE_ID])
+        self.assertEqual(confirmed["empty_cleanup"], [])
+        self.assertFalse(confirmed["awaiting_done_confirm"])
+
+    def test_confirm_keeps_changed_empty_cleanup_source(self):
+        candidate = workflow.Candidate.from_notion_page(source_row(SOURCE_ID, name="empty item"))
+        record = {
+            "session_id": "session-1",
+            "operation_id": "empty-op",
+            "source_page_id": SOURCE_ID,
+            "source_url": candidate.source_url,
+            "fingerprint": workflow.candidate_fingerprint(candidate),
+        }
+
+        class ChangedEmptyClient(FakeClient):
+            def retrieve_page(self, page_id):
+                return source_row(SOURCE_ID, name="empty item", learnings="now has content")
+
+        client = ChangedEmptyClient([])
+        updated = self.run_with_files(client, {"empty_cleanup": [record], "awaiting_done_confirm": True}, workflow.command_confirm)
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertTrue(updated["awaiting_done_confirm"])
+        self.assertEqual(len(updated["empty_cleanup"]), 1)
+        self.assertIn("unchecked or changed", updated["needs_review"][0]["needs_review"])
 
     def test_confirm_finalizes_checked_pending_sources_after_done(self):
         client = FakeClient([ledger_page()])

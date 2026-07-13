@@ -50,7 +50,7 @@ Maintain a tiny project-side local backup for every organize session.
   - operation id
   - source row URL/id
   - target archive row URL/id after move
-  - action status: candidate/moved/dismissed/skipped/undone/empty-removed/removal-proposed/removed
+  - action status: candidate/moved/dismissed/skipped/undone/empty-pending-cleanup/removal-proposed/removed
   - timestamps
 - Do not duplicate full `Name`, `收获`, or `改进` in local backup. Source and target Notion rows remain the canonical content stores.
 - In real mode, do not create Notion safety/log/ledger pages or hidden backend pages for machine bookkeeping. Use only the minimal local `.todo_archive` pointers needed to resume, undo, and verify the current organize session.
@@ -98,7 +98,7 @@ Follow this sequence exactly:
    - source rows proposed for removal
 8. Treat the user's `done` command as ending the organize loop and entering final confirmation. Show a short change summary, then ask whether to confirm today's changes. Only after the user replies `confirm`, remove/archive checked pending source rows and, in test mode, mark their ledger rows `removed`.
 
-Never remove/archive successfully moved source rows during the 5-item batch loop. A checked source row with both `收获` and `改进` empty is an ordered cleanup candidate, not an archive-content candidate: when it is reached in bottom-first order, record it in local backup/state and keep scanning for real move candidates. In the test sandbox, an approved write path may remove that empty source row as ordered cleanup; in real mode, preview/next must not remove it, and source cleanup still requires the separate `done` -> `confirm` approval path. Empty cleanup candidates do not count toward the 5 candidate rows or the 30 moved-row limit.
+Never remove/archive source rows during the 5-item batch loop. A checked source row with both `收获` and `改进` empty is an ordered cleanup candidate, not an archive-content candidate: when reached in bottom-first order, record it in local backup/state and keep scanning for real move candidates. In both test and real mode, source cleanup requires the separate `done` -> `confirm` approval path. Empty cleanup candidates do not count toward the 5 candidate rows or the 30 moved-row limit.
 
 Source cleanup archives the source page with Notion's recoverable `archived: true` state so it leaves the active source table. It is not a permanent destroy operation.
 
@@ -155,10 +155,10 @@ Source cleanup archives the source page with Notion's recoverable `archived: tru
 - In real mode, never create or update a Notion ledger, safety log, or machine-only log page. The user-facing archive tables and source rows are the only Notion writes.
 - Maintain the local 7-day backup alongside the test Notion ledger. In real mode, the local backup is the only machine bookkeeping store.
 - Source rows with `完成` unchecked are never candidates.
-- Checked rows with both `收获` and `改进` empty are ordered cleanup candidates, not move candidates. Do not bulk-delete all such rows at startup. Only when one is reached during the normal bottom-first scan, record it in local backup/state and continue scanning. In the test sandbox, an approved write path may remove it as `empty-removed`; in real mode, leave it for the separate source-cleanup approval path. It does not count as one of the 5 approval candidates.
+- Checked rows with both `收获` and `改进` empty are ordered cleanup candidates, not move candidates. Do not bulk-delete all such rows at startup. Only when one is reached during the normal bottom-first scan, record it in local backup/state and continue scanning. Leave it for the separate `done` -> `confirm` source-cleanup approval path in both modes. It does not count as one of the 5 approval candidates.
 - A successful move means creating one row in the category archive table with only `Name`, `收获`, and `改进`.
 - Category archive rows must not inherit source relations or source-only fields. In particular, do not copy `project-test` relation or any other relation from `to-do-test`; use `category` only to choose the target archive table.
-- The successful move limit comes from session `move_limit` defaulting from config. Empty deletion candidates do not count toward the limit.
+- The successful move limit comes from session `move_limit` defaulting from config. Empty cleanup candidates do not count toward the limit.
 - If an organize run is interrupted, never assume copied rows were also removed. Run the stability check before resuming or deleting anything.
 - The workflow is an on-demand organizer, not the owner/maintainer of the whole Notion list. Do not scan, repair, deduplicate, or maintain all source/category rows unless the user explicitly asks for a separate audit.
 - When considering a checked candidate, before copying it, check only its configured category archive table for a strict manual match: current `Name`, `收获`, and `改进` must all match. If found, record a local `manual-match`; in test mode also record ledger action `manual-match` with stability `pending-removal`. Skip the duplicate copy and continue scanning. Do not treat name-only matches as sufficient.
@@ -221,10 +221,10 @@ For `organize todo-test`:
 1. Use the Notion connector to read/fetch the `to-do-test` schema if needed.
 2. Gather candidate source rows bottom-first, interpreted as oldest checked rows first.
 3. Include only rows where `完成` is checked.
-4. If a checked row has both `收获` and `改进` empty, handle it only if it has been reached in this scan order. In the test sandbox write path, remove that empty source row and record `empty-removed` in local backup/state; in real mode, keep it as a proposed cleanup candidate for the separate source-cleanup approval path. Do not add it to the active batch, and continue scanning for the next row. Never clear all empty rows globally before selection.
+4. If a checked row has both `收获` and `改进` empty, handle it only if it has been reached in this scan order. Record it as pending cleanup in local backup/state for the separate `done` -> `confirm` path. Do not add it to the active batch, and continue scanning for the next row. Never clear all empty rows globally before selection.
 5. Include only rows whose text `category` matches an available test archive table.
 6. Exclude rows already in an effective `moved` + not-`undone` ledger state.
-7. Present at most the configured `batch_size` move candidates. Empty removals do not count toward this size.
+7. Present at most the configured `batch_size` move candidates. Empty cleanup candidates do not count toward this size.
 8. Persist the active batch, plus session `batch_size` and `move_limit`, as local state before accepting `ok`, `dismiss`, or `skip`. Snapshot source row URLs/ids, category, a short `name_hint`, and a content fingerprint in local backup/state.
 9. If empty checked rows were handled while selecting the batch, show a compact ordered-cleanup summary before the candidate list. In real mode, describe them as proposed cleanup only.
 

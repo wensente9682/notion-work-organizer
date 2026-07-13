@@ -57,7 +57,12 @@ def load_json(path: Path) -> dict:
 
 
 def save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    if path.parent.parent.name == ".todo_archive":
+        path.parent.parent.chmod(0o700)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
     path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
 
 

@@ -536,6 +536,11 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.parent.name == ".todo_archive":
+        path.parent.chmod(0o700)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -1281,7 +1286,7 @@ def empty_checked_candidate(page: dict[str, Any], config: dict[str, Any] | None 
     return candidate
 
 
-def remove_empty_checked_row(
+def record_empty_checked_row(
     state: dict[str, Any],
     client: NotionClient,
     page: dict[str, Any],
@@ -1291,20 +1296,22 @@ def remove_empty_checked_row(
     if candidate is None:
         raise WorkflowError("Internal error: source row is not an empty checked row.")
     batch_id = int(state.get("batch_id", 0))
+    session_id = ensure_backup_session(state)
     record = {
-        "action": "empty-removed",
-        "status": "removed",
+        "action": "empty-pending-cleanup",
+        "status": "pending-removal",
         "batch": batch_id,
+        "session_id": session_id,
+        "operation_id": operation_id(session_id, candidate.source_page_id, 0),
         "category": candidate.category,
         "name_hint": candidate.name,
         "source_page_id": candidate.source_page_id,
         "source_url": candidate.source_url,
-        "removed_at": now_seconds(),
+        "fingerprint": candidate_fingerprint(candidate),
     }
     backup_record(state, record)
-    client.archive_page(candidate.source_page_id)
-    state.setdefault("empty_removed", []).append(record)
-    state.setdefault("_empty_removed_this_batch", []).append(record)
+    state.setdefault("empty_cleanup", []).append(record)
+    state.setdefault("_empty_cleanup_this_batch", []).append(record)
     return record
 
 
@@ -1673,6 +1680,18 @@ def verify_dismissed_record_for_source_removal(
         )
 
 
+def verify_empty_cleanup_record_for_source_removal(
+    config: dict[str, Any], client: NotionClient, record: dict[str, Any]
+) -> None:
+    source_page = verify_page_scope(client, record["source_page_id"], config["source_database_id"], "Source")
+    current = empty_checked_candidate(source_page, config)
+    if current is None or record.get("fingerprint") != candidate_fingerprint(current):
+        raise WorkflowError(
+            "Final source removal stopped: empty cleanup source row is unchecked or changed. "
+            f"Review before removing: {record.get('source_url') or record.get('source_page_id')}"
+        )
+
+
 def record_from_ledger_pending_move(
     config: dict[str, Any],
     client: NotionClient,
@@ -1971,9 +1990,10 @@ def make_batch(config: dict[str, Any], state: dict[str, Any], limit: int) -> lis
         | manual_match_source_ids(state)
         | dismissed_source_ids(state)
         | skipped_source_ids(state)
+        | {notion_id(item["source_page_id"]) for item in state.get("empty_cleanup", []) if item.get("source_page_id")}
         | ledger_moved_source_ids(config, client)
     )
-    state["_empty_removed_this_batch"] = []
+    state["_empty_cleanup_this_batch"] = []
     state["_manual_matched_this_batch"] = []
     session_id = ensure_backup_session(state)
     batch_id = int(state.get("batch_id", 0))
@@ -1985,7 +2005,7 @@ def make_batch(config: dict[str, Any], state: dict[str, Any], limit: int) -> lis
             if page_id in already_handled:
                 continue
             if empty_checked_candidate(page, config) is not None:
-                remove_empty_checked_row(state, client, page, config)
+                record_empty_checked_row(state, client, page, config)
                 continue
             candidate = eligible_candidate(page, config)
             if candidate is None:
@@ -2239,7 +2259,7 @@ def command_next(args: argparse.Namespace) -> None:
         ]
     else:
         batch = make_batch(config, state, options["batch_size"])
-        empty_removed = state.pop("_empty_removed_this_batch", [])
+        empty_removed = state.pop("_empty_cleanup_this_batch", [])
         manual_matched = state.pop("_manual_matched_this_batch", [])
     state["batch"] = [item.to_state() for item in batch]
     state["preflight_ok"] = True
@@ -2253,7 +2273,7 @@ def command_next(args: argparse.Namespace) -> None:
         if config_mode(config) == REAL_MODE:
             print("Would remove empty completed rows after separate source-cleanup approval:")
         else:
-            print("Removed empty completed rows reached in order:")
+            print("Pending empty completed rows reached in order:")
         for item in empty_removed:
             label = f"[{item.get('category')}] " if item.get("category") else ""
             print(f"  - {label}{item.get('name_hint') or item.get('source_page_id')}")
@@ -2753,7 +2773,7 @@ def command_done(args: argparse.Namespace) -> None:
     state = load_json(args.state, {"batch": [], "moved": [], "skipped": []})
     finish_backup_session(state, "done")
     state["done"] = True
-    state["awaiting_done_confirm"] = bool(state.get("moved") or state.get("manual_matches") or state.get("dismissed"))
+    state["awaiting_done_confirm"] = bool(state.get("moved") or state.get("manual_matches") or state.get("dismissed") or state.get("empty_cleanup"))
     save_json(args.state, state)
     moved = state.get("moved", [])
     manual_matches = state.get("manual_matches", [])
@@ -2773,10 +2793,10 @@ def command_done(args: argparse.Namespace) -> None:
     if dismissed:
         for record in dismissed:
             print(f"  - [{record.get('category')}] {record.get('name')}")
-    empty_removed = state.get("empty_removed", [])
-    print(f"deleted empty completed rows: {len(empty_removed)}")
-    if empty_removed:
-        for record in empty_removed:
+    empty_cleanup = state.get("empty_cleanup", [])
+    print(f"pending empty completed rows: {len(empty_cleanup)}")
+    if empty_cleanup:
+        for record in empty_cleanup:
             label = f"[{record.get('category')}] " if record.get("category") else ""
             print(f"  - {label}{record.get('name_hint') or record.get('source_page_id')}")
     print(f"skipped: {len(skipped)}")
@@ -2799,7 +2819,7 @@ def command_confirm(args: argparse.Namespace) -> None:
         return
     removed = finalize_source_removal(config, state, args.state)
     state = load_json(args.state, {"batch": [], "moved": [], "skipped": []})
-    state["awaiting_done_confirm"] = bool(state.get("moved") or state.get("manual_matches") or state.get("dismissed"))
+    state["awaiting_done_confirm"] = bool(state.get("moved") or state.get("manual_matches") or state.get("dismissed") or state.get("empty_cleanup"))
     save_json(args.state, state)
     print("confirmed")
     if state["awaiting_done_confirm"]:
@@ -2807,13 +2827,14 @@ def command_confirm(args: argparse.Namespace) -> None:
     if removed:
         print("finalized removals:")
         for record in removed:
-            print(f"  - [{record.get('category')}] {record.get('name')}")
+            print(f"  - [{record.get('category')}] {record.get('name') or record.get('name_hint')}")
 
 
 def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state_path: Path) -> list[dict[str, Any]]:
     moved = [dict(record, _state_bucket="moved") for record in state.get("moved", [])]
     moved.extend(dict(record, _state_bucket="manual_matches") for record in state.get("manual_matches", []))
     moved.extend(dict(record, _state_bucket="dismissed") for record in state.get("dismissed", []))
+    moved.extend(dict(record, _state_bucket="empty_cleanup") for record in state.get("empty_cleanup", []))
     client = get_client()
     if not moved:
         moved = ledger_pending_removal_records(config, client)
@@ -2824,13 +2845,13 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
     incomplete = [
         record
         for record in moved
-        if record.get("_state_bucket") == "dismissed"
+        if record.get("_state_bucket") in {"dismissed", "empty_cleanup"}
         and not (record.get("source_page_id") and record.get("operation_id") and record.get("fingerprint"))
     ]
     incomplete.extend(
         record
         for record in moved
-        if record.get("_state_bucket") != "dismissed"
+        if record.get("_state_bucket") not in {"dismissed", "empty_cleanup"}
         and not (
             record.get("source_page_id")
             and record.get("target_page_id")
@@ -2849,6 +2870,7 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
     remaining_moved = []
     remaining_manual_matches = []
     remaining_dismissed = []
+    remaining_empty_cleanup = []
     removed = []
     needs_review = []
     attempted_ops = {record.get("operation_id") for record in moved if record.get("operation_id")}
@@ -2869,6 +2891,8 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
                 remaining_manual_matches.append(kept)
             elif record.get("_state_bucket") == "dismissed":
                 remaining_dismissed.append(kept)
+            elif record.get("_state_bucket") == "empty_cleanup":
+                remaining_empty_cleanup.append(kept)
             elif record.get("_state_bucket") == "moved":
                 remaining_moved.append(kept)
             print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
@@ -2881,13 +2905,18 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
                 remaining_manual_matches.append(kept)
             elif record.get("_state_bucket") == "dismissed":
                 remaining_dismissed.append(kept)
+            elif record.get("_state_bucket") == "empty_cleanup":
+                remaining_empty_cleanup.append(kept)
             elif record.get("_state_bucket") == "moved":
                 remaining_moved.append(kept)
             print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
             print("  reason: Final source removal stopped: this source row was skipped.")
             continue
         try:
-            if record.get("_state_bucket") == "dismissed":
+            if record.get("_state_bucket") == "empty_cleanup":
+                verify_empty_cleanup_record_for_source_removal(config, client, record)
+                ledger_move = LedgerMove("", "", "empty-cleanup", "", "", record.get("source_url", ""), "", record.get("category", ""), int(record.get("batch") or 0), 0)
+            elif record.get("_state_bucket") == "dismissed":
                 verify_dismissed_record_for_source_removal(config, client, record)
                 ledger_move = LedgerMove(
                     page_id="",
@@ -2918,6 +2947,8 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
                 remaining_manual_matches.append(kept)
             elif record.get("_state_bucket") == "dismissed":
                 remaining_dismissed.append(kept)
+            elif record.get("_state_bucket") == "empty_cleanup":
+                remaining_empty_cleanup.append(kept)
             elif record.get("_state_bucket") == "moved":
                 remaining_moved.append(kept)
             print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
@@ -2935,7 +2966,7 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
                 "batch": record.get("batch_id"),
                 "number": record.get("batch_number"),
                 "category": record.get("category"),
-                "name_hint": record.get("name"),
+                "name_hint": record.get("name") or record.get("name_hint"),
                 "source_page_id": source_page_id,
                 "source_url": record.get("source_url"),
                 "target_page_id": record.get("target_page_id"),
@@ -2951,6 +2982,7 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
     state["moved"] = remaining_moved
     state["manual_matches"] = remaining_manual_matches
     state["dismissed"] = remaining_dismissed
+    state["empty_cleanup"] = remaining_empty_cleanup
     if attempted_ops:
         state["needs_review"] = [
             record
@@ -2963,7 +2995,7 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
     save_json(state_path, state)
     print(f"removed source rows: {len(removed)}")
     for record in removed:
-        print(f"  {record.get('batch_number')}: {record.get('source_url', '')}")
+        print(f"  {record.get('batch_number') or record.get('batch')}: {record.get('source_url', '')}")
     return removed
 
 
@@ -2973,9 +3005,9 @@ def command_remove_sources(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     require_real_command_allowed(config, "remove-sources")
     state = load_json(args.state, {"batch": [], "moved": [], "skipped": []})
-    if state.get("dismissed"):
+    if state.get("dismissed") or state.get("empty_cleanup"):
         raise WorkflowError(
-            "Dismissed source rows require the normal `done` -> `confirm` cleanup path. "
+            "Dismissed and empty-cleanup source rows require the normal `done` -> `confirm` cleanup path. "
             "Run `done`, review the summary, then reply `confirm`."
         )
     finalize_source_removal(config, state, args.state)
