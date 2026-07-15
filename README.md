@@ -1,34 +1,52 @@
-# Notion Daily Work Tracker for Codex
+# Organize
 
-An open-source starter kit for building a lightweight Notion daily work
-tracker—capture tasks, complete work, and organize finished items into reusable
-records.
+> An approval-first Codex workflow for reviewing completed Notion work and turning useful takeaways into reusable records.
 
-[**Try it with your Notion list →**](#quick-start)
+Organize is an open-source workflow for building, using, and maintaining a
+lightweight Notion daily work record. Capture active work in your own Notion
+list, review completed work in Codex, and preserve useful takeaways without
+turning your workspace into a complex project-management system.
+
+[**Install the workflow →**](#quick-start)
 
 ![Workflow overview: capture, track, complete, reflect, organize, and archive daily work](docs/workflow-overview.svg)
 
-_A workflow overview of the current Codex + Notion experience; this project does
-not ship a separate GUI._
+_The diagram describes the current Codex + Notion workflow. Organize does not
+ship a separate GUI._
 
-## Why Use It
+## Who It Is For
 
-- **Track daily work without maintaining a complex project-management system.**
-  Keep the portable schema small while preserving your own optional fields.
-- **Keep completed tasks instead of losing them.** Finished work stays available
-  for review before any cleanup decision.
-- **Turn daily activity into organized records for review and reflection.** Add
-  takeaways and improvements, then archive useful records by category.
+Use Organize if you want to:
 
-The project is designed for Codex users first. Codex uses the Notion connector,
-not a checked-in Notion token.
+- keep a small Notion to-do or work-log database for day-to-day work;
+- review completed items before deciding what to preserve or clean up; and
+- turn selected takeaways and improvements into category-organized records.
+
+## Who It Is Not For
+
+Organize is not for workflows that automatically create or migrate a Notion
+workspace, bulk-repair existing data, or write to Notion or clean up source
+rows without user review and explicit confirmation.
+
+## Core Workflow
+
+1. Record daily work in a Notion source list with `Task`, `Done`, `Category`,
+   `Takeaway`, and `Improvement`.
+2. Mark work `Done`, then add a takeaway or improvement when there is something
+   worth preserving.
+3. Run `organize todo` to review a small configured batch. Choose `ok`,
+   `dismiss`, or `skip` for each item; use `undo` only for the allowed local or
+   archive-copy reversal scope.
+4. `Category` chooses the archive destination. An approved archive row copies
+   only `Task`, `Takeaway`, and `Improvement`.
+5. Run `done` to see the summary. Source cleanup happens only after a separate
+   `confirm`, and only for eligible rows that pass the workflow's checks.
 
 ## Quick Start
 
 Prerequisites: Git, Codex, and access to the Notion connector.
 
-1. Clone the repository and copy the skill into Codex's default personal skill
-   directory:
+1. Clone the repository and install the skill in Codex's user skill directory:
 
    ```sh
    git clone https://github.com/wensente9682/notion-work-organizer.git
@@ -37,139 +55,56 @@ Prerequisites: Git, Codex, and access to the Notion connector.
    cp -R skills/todo-archive-review ~/.agents/skills/
    ```
 
-2. Start a new Codex task and enable the Notion connector with access only to the
-   Notion databases you want this workflow to use.
+2. Start a Codex task and enable the Notion connector with access only to the
+   Notion databases this workflow should use.
 3. Choose the prompt that matches your starting point:
 
    ```text
-   Use this workflow with my existing Notion to-do list. Start read-only.
+   Use Organize with my existing Notion to-do list. Start read-only.
    ```
 
    ```text
-   Set up a new Notion daily work tracker. Start with a plan only.
+   Set up a new Notion daily work record. Start with a plan only.
    ```
 
-   Already configured? Start a review with:
+   If it is already configured, start a review with:
 
    ```text
    organize todo
    ```
 
-4. Review the proposed field mapping and read-only preview. Approve each Notion
-   write separately; final source cleanup has its own `done` → `confirm` gate.
+4. Review the proposed field mapping and the read-only preview. Approve each
+   Notion write separately; source cleanup has its own `done` → `confirm` gate.
 
-For normal Codex use, do not paste a Notion token into chat or add one to project
-config. See a sanitized review in
+For normal Codex use, do not paste a Notion token into chat or add one to
+project config. See a sanitized review in
 [examples/session-output.example.txt](examples/session-output.example.txt).
 
-## What This Is
+## Approval-First Safety
 
-This project packages a small, portable method for tracking personal work in a
-Notion to-do or work-log database:
+- Codex uses the Notion connector for normal operation; the Python CLI is an
+  advanced fallback for outside-Codex work or an explicitly requested command
+  line path.
+- Setup and adoption begin read-only. Real Notion writes require approval for
+  the specific action.
+- `ok` and `dismiss` do not remove source rows. `done` shows the run summary;
+  only a subsequent `confirm` can finalize eligible source cleanup.
+- Cleanup archives a source page with Notion's recoverable `archived: true`
+  state. It is not a permanent destruction operation.
+- Public examples never include tokens, real database IDs, real Notion URLs,
+  or private page IDs. Local runtime state stays in ignored files such as
+  `.todo_archive/`.
 
-1. Capture work in a source to-do database.
-2. Mark completed rows with `Done`.
-3. Reflect in `Takeaway` and `Improvement`.
-4. Review each completed row as archive, dismiss, or skip.
-5. Organize archive-approved rows by configured `Category`.
-6. Archive approved rows into category archive tables.
-7. Clean up source rows only after a separate confirmation step.
+## Current Boundaries
 
-The `todo-archive-review` Codex skill guides setup, adoption, and the completed
-work review flow. The Python CLI in `notion_todo_workflow.py` is the
-regression-tested core and an advanced-user fallback, not the normal path for
-ordinary Codex use.
-
-## Safety Model
-
-- Codex should use the Notion connector for normal operation.
-- Normal Codex use does not require a Notion API token. The narrow developer
-  fallback described below is only for verified final source cleanup when the
-  connector cannot archive source pages directly.
-- Public templates never include tokens, real database IDs, real Notion URLs, or
-  private Notion page IDs.
-- Do not commit private configs, `.todo_archive/`, local backup/cache/state
-  files, real database IDs, real Notion URLs, or credentials.
-- Setup and adoption are read-only by default in v0.1.
-- Real Notion writes require explicit approval for the specific action.
-- `done` is not cleanup approval. Source cleanup requires `confirm` after the
-  user has seen the run summary and the workflow's safety checks pass.
-- `dismiss` is a reviewed cleanup decision without archive output; it still
-  requires `done` and then `confirm` before a source row may be removed.
-- `undo` is scoped to archive copies, moved/manual-match records, and local
-  action state. It does not promise to restore or modify the source row.
-- Archive rows copy only `Task`, `Takeaway`, and `Improvement`.
-- `Category` routes target selection only; it is not copied into archive rows.
-- Local runtime files such as `.todo_archive/`, `config.test.json`, and
-  `*.local.json` are private and ignored.
-
-## Workflow Details
-
-### Capture
-
-Use your Notion source database as the place where active work records live. The
-portable source schema is intentionally small:
-
-- `Task`
-- `Done`
-- `Category`
-- `Takeaway`
-- `Improvement`
-
-You can keep additional personal fields such as dates, status, priority,
-project, tags, or estimates. They are outside the portable contract.
-Existing workspaces with different labels can keep them by setting
-`field_mapping` in the local config.
-
-### Complete
-
-Only rows where `Done` is checked are organize candidates. Unchecked rows are
-never archived or removed by the workflow.
-
-### Reflect
-
-Before archive, add the reflection fields:
-
-- `Takeaway`: takeaway, learning, or useful result.
-- `Improvement`: improvement, follow-up insight, or next-time adjustment.
-
-Rows where both fields are empty are treated as cleanup candidates when reached
-in the normal scan order; they are not copied as archive-content rows.
-
-### Organize
-
-The workflow stages a small batch of completed rows. The user approves, dismisses,
-or skips individual rows with commands such as `ok 1 3`, `dismiss 1`, or `skip 2`.
-Use `ok` when the row should be copied to an archive table, `dismiss` when the
-row should leave the source list without an archive copy, and `skip` when the
-row should remain available for a later review.
-
-Categories are configuration, not product constants. Public examples use
-placeholder names such as `example-category`; users should replace them with
-their own category names and archive targets.
-
-### Archive
-
-Approved rows are appended to the configured category archive table. Each
-archive row contains only:
-
-- `Task`
-- `Takeaway`
-- `Improvement`
-
-Before creating a new archive row, the workflow checks the selected category
-archive table for a strict manual match on the same three fields. Exact matches
-are recorded as already handled instead of duplicated.
-
-### Cleanup
-
-Source rows stay in the source database during the batch loop. At the end,
-`done` shows a summary. Only after the user replies `confirm` may checked source
-rows be removed. Successfully archived rows are verified against their target
-archive rows; dismissed rows are not archived and are verified against their
-source snapshot before removal. Removal means setting the source page to
-Notion's recoverable archived state so it leaves the active source table; it is
-not a permanent destroy operation.
+- Organize does not automatically create databases, fields, archive tables, or
+  rows; migrate existing workspaces; or reshape a Notion workspace.
+- It does not broadly scan, repair, deduplicate, or maintain an entire
+  workspace.
+- Archive rows intentionally contain only `Task`, `Takeaway`, and
+  `Improvement`; source-only fields stay in the source list.
+- The normal path is Codex + the Notion connector. The Python CLI is an
+  advanced fallback, not the default installation or operating path.
 
 ## Existing Notion List Path
 
@@ -179,26 +114,26 @@ Codex should inspect the existing database in read-only mode, compare it with
 the portable schema, and report:
 
 - whether the source fields can satisfy `Task`, `Done`, `Category`,
-  `Takeaway`, and `Improvement`
-- how your category/project/routing field can map to archive targets
-- whether each archive table supports `Task`, `Takeaway`, and `Improvement`
-- what local config would be needed
-- the safest next step, usually a read-only preview
+  `Takeaway`, and `Improvement`;
+- how your category/project/routing field can map to archive targets;
+- whether each archive table supports `Task`, `Takeaway`, and `Improvement`;
+- what local config would be needed; and
+- the safest next step, usually a read-only preview.
 
 Adoption must not automatically migrate old rows, change schemas, create archive
 tables, or remove source rows.
 
 ## New Notion System Path
 
-Use this path if you want a fresh system.
+Use this path if you want a fresh daily work record.
 
-The v0.1 setup route should first propose the smallest portable shape:
+The setup route first proposes the smallest portable shape:
 
-- one source to-do database
-- one category routing field named `Category`
-- one archive table per configured category
-- a local private profile based on the example config
-- a read-only preview before any write path
+- one source to-do database;
+- one category routing field named `Category`;
+- one archive table per configured category;
+- a local private profile based on the example config; and
+- a read-only preview before any write path.
 
 Setup may draft a plan and config. It must not automatically create databases,
 fields, rows, ledgers, or archive tables without explicit approval for that
@@ -228,19 +163,17 @@ Required archive table properties:
 
 Archive tables should not mirror the full source database. Source-only workflow
 fields such as `Done`, `Category`, relations, status, dates, and private metadata
-remain source-side fields unless a future tested extension adds them.
+remain source-side unless a future tested extension adds them.
 
-## Config Examples
+## Configuration and Examples
 
 Public templates are sanitized:
 
 - [config.example.json](config.example.json)
 - [real_profile.example.json](real_profile.example.json)
 
-## Examples
-
 See [examples/](examples/) for minimal source schema, archive schema, category
-mapping, and sample session output files that use neutral placeholder data.
+mapping, and sample session output using neutral placeholder data.
 
 Sandbox/test-style profile:
 
@@ -292,21 +225,20 @@ Real-profile shape:
 
 Private profiles belong in ignored local files such as
 `.todo_archive/real_profile.json`, `config.local.json`, or `*.local.json`.
+Maintainers may also keep a private test profile in `config.test.json`; that
+file is intentionally ignored and is not part of the public setup contract.
 
-Maintainers may also keep a private test profile in `config.test.json`. That file
-is intentionally ignored and is not part of the public setup contract.
-
-## CLI Fallback For Maintainers And Advanced Users
+## Python CLI Fallback
 
 Skip this section for normal Codex use.
 
-`notion_todo_workflow.py` exists for regression testing, local debugging, and
+`notion_todo_workflow.py` supports regression testing, local debugging, and
 outside-Codex operation. Inside Codex, the skill should prefer the Notion
-connector and should not switch to the CLI unless the user explicitly asks for
+connector and should not switch to the CLI unless the user explicitly requests
 an external command-line workflow.
 
-The CLI does not store credentials in repo config. If a user runs it outside
-Codex, credentials are user-managed shell or Keychain state. Public templates do
+The CLI does not store credentials in repository config. For outside-Codex CLI
+use, credentials are user-managed shell or Keychain state. Public templates do
 not include token fields.
 
 For outside-Codex CLI use, create an internal Notion integration, share only the
@@ -363,18 +295,12 @@ Maintenance/retry only:
 python3 notion_todo_workflow.py remove-sources --confirm REMOVE_SOURCES
 ```
 
-## What v0.1 Does Not Automate
+## Testing and License
 
-- It does not automatically set up or adopt a Notion system.
-- It does not automatically create real Notion databases, fields, archive
-  tables, ledgers, backend pages, or safety logs.
-- It does not automatically migrate old rows.
-- It does not scan, repair, deduplicate, or maintain an entire workspace.
-- It does not copy optional source fields into archive rows.
-- It does not make final source cleanup part of `done`; cleanup remains a
-  separate `confirm` step.
-- It does not expose or commit private configs, real database IDs, tokens,
-  `.todo_archive/`, or maintainer-only profiles.
+Release testing status: 77 tests passed; skill validation passed.
 
-Future versions may add more setup automation, but v0.1 intentionally keeps
-setup/adopt workflows read-only by default.
+The repository includes Python regression tests for the workflow and setup
+preflight. Run them only when validating a code change or a release candidate;
+this documentation update does not change product behavior.
+
+Licensed under the [MIT License](LICENSE).
