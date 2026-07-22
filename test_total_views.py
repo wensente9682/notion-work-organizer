@@ -794,7 +794,7 @@ class TotalFromViewTest(unittest.TestCase):
         self.assertEqual({}, result.totals)
         self.assertEqual(300, sum(call[0] == "retrieve" for call in api.calls))
 
-    def test_month_scan_rejects_missing_initial_request_status_before_retrieve(self):
+    def test_month_scan_accepts_missing_initial_request_status_when_complete(self):
         api = FakeViewsApi(
             {
                 "object": "view_query",
@@ -807,17 +807,20 @@ class TotalFromViewTest(unittest.TestCase):
             }
         )
 
-        with self.assertRaisesRegex(TotalViewError, "not complete"):
-            total_from_view(
-                api,
-                view_id="view-example",
-                target_month=date(2026, 7, 1),
-                fields=FIELDS,
-            )
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
 
-        self.assertEqual([("create", "view-example", 100)], api.calls)
+        self.assertEqual({"Research": Decimal("2")}, result.totals)
+        self.assertEqual(
+            [("create", "view-example", 100), ("retrieve", "page-example-1")],
+            api.calls,
+        )
 
-    def test_month_scan_rejects_missing_paginated_status_before_that_page_retrieve(self):
+    def test_month_scan_accepts_missing_paginated_status_when_complete(self):
         api = FakeViewsApi(
             {
                 "object": "view_query",
@@ -840,20 +843,126 @@ class TotalFromViewTest(unittest.TestCase):
             ],
         )
 
-        with self.assertRaisesRegex(TotalViewError, "not complete"):
-            total_from_view(
-                api,
-                view_id="view-example",
-                target_month=date(2026, 7, 1),
-                fields=FIELDS,
-            )
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
 
+        self.assertEqual({"Research": Decimal("2")}, result.totals)
         self.assertEqual(
             [
                 ("create", "view-example", 100),
                 ("retrieve", "page-example-1"),
                 ("results", "view-example", "query-example", "cursor-one", 100),
+                ("retrieve", "page-example-2"),
             ],
+            api.calls,
+        )
+
+    def test_initial_status_when_present_must_be_explicitly_complete(self):
+        for status in (None, {}, {"type": "incomplete"}, {"type": "queued"}):
+            with self.subTest(status=status):
+                api = FakeViewsApi(
+                    {
+                        "object": "view_query",
+                        "id": "query-example",
+                        "view_id": "view-example",
+                        "total_count": 1,
+                        "results": [page(anchor="2026-07-31")],
+                        "next_cursor": None,
+                        "has_more": False,
+                        "request_status": status,
+                    }
+                )
+
+                with self.assertRaisesRegex(TotalViewError, "not complete"):
+                    total_from_view(
+                        api,
+                        view_id="view-example",
+                        target_month=date(2026, 7, 1),
+                        fields=FIELDS,
+                    )
+
+                self.assertEqual([("create", "view-example", 100)], api.calls)
+
+    def test_paginated_status_when_present_must_be_explicitly_complete(self):
+        for status in (None, {}, {"type": "incomplete"}, {"type": "queued"}):
+            with self.subTest(status=status):
+                api = FakeViewsApi(
+                    {
+                        "object": "view_query",
+                        "id": "query-example",
+                        "view_id": "view-example",
+                        "total_count": 2,
+                        "results": [page(anchor="2026-08-01")],
+                        "next_cursor": "cursor-one",
+                        "has_more": True,
+                        "request_status": {"type": "complete"},
+                    },
+                    pages=[
+                        {
+                            "object": "list",
+                            "type": "page",
+                            "results": [page(anchor="2026-07-31")],
+                            "next_cursor": None,
+                            "has_more": False,
+                            "request_status": status,
+                        }
+                    ],
+                )
+
+                with self.assertRaisesRegex(TotalViewError, "not complete"):
+                    total_from_view(
+                        api,
+                        view_id="view-example",
+                        target_month=date(2026, 7, 1),
+                        fields=FIELDS,
+                    )
+
+                self.assertEqual(
+                    [
+                        ("create", "view-example", 100),
+                        ("retrieve", "page-example-1"),
+                        (
+                            "results",
+                            "view-example",
+                            "query-example",
+                            "cursor-one",
+                            100,
+                        ),
+                    ],
+                    api.calls,
+                )
+
+    def test_real_shape_initial_page_can_omit_request_status(self):
+        rows = [page(anchor="2026-06-30", done=False, categories=())]
+        rows.extend(
+            page(anchor=None, done=False, categories=()) for _ in range(99)
+        )
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 101,
+                "results": rows,
+                "next_cursor": "cursor-one",
+                "has_more": True,
+            }
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({}, result.totals)
+        self.assertEqual(
+            [("create", "view-example", 100), ("retrieve", "page-example-1")],
             api.calls,
         )
 

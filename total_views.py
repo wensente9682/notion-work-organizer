@@ -302,6 +302,8 @@ def _item(page: dict[str, Any], fields: TotalViewFields) -> TotalItem:
 def _require_complete(response: dict[str, Any]) -> None:
     if not isinstance(response, dict):
         raise TotalViewError("view query response contract is incomplete")
+    if "request_status" not in response:
+        return
     status = response.get("request_status")
     if not isinstance(status, dict) or status.get("type") != "complete":
         raise TotalViewError("view query is not complete")
