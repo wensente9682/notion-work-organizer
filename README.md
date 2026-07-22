@@ -51,8 +51,7 @@ Prerequisites: Git, Codex, and access to the Notion connector.
    ```sh
    git clone https://github.com/wensente9682/notion-work-organizer.git
    cd notion-work-organizer
-   mkdir -p ~/.agents/skills
-   cp -R skills/todo-archive-review ~/.agents/skills/
+   python3 -B skills/todo-archive-review/scripts/install.py
    ```
 
 2. Start a Codex task and enable the Notion connector with access only to the

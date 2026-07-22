@@ -17,12 +17,23 @@ Core principle: reduce mechanical copying while preserving the user's manual rec
 
 Choose exactly one route from the user's request:
 
+- **Monthly total**: use only when the user says `total YYYY-MM`. Validate the month before reading local config or calling Notion, then follow the read-only total route below.
 - **Organize existing workflow**: use when the user says `organize todo-test`, `organize todo`, `next`, `ok`, `dismiss`, `skip`, `undo`, `save`, `done`, `confirm`, `check`, `status`, or asks to review/archive existing Notion to-do records. Before acting, read `references/organize.md`.
 - **Adopt existing Notion list**: use when the user asks to configure, connect, adopt, migrate, inspect, or use an existing Notion to-do list with this system. Before acting, read `references/adopt-existing.md`.
 - **Setup new system**: use when the user asks to create, initialize, or set up a new Notion personal work/to-do system. Before acting, read `references/setup.md`.
 - **Schema/config/label help**: use when the user asks what fields/config are required, wants to rename Notion labels/properties, or asks how custom labels affect organize. Read `references/schema.md` if present; otherwise use the project-level `docs/schema.md`.
 
 If the request is an organize command and organize-owned local config/state already exists, stay on the organize route. Do not start setup/adopt onboarding unless the user explicitly asks for it.
+
+## Monthly Total Route
+
+- Accept only `total YYYY-MM`, with a real calendar month in that exact format. Missing or invalid months stop before config, credentials, or Notion access.
+- Run the installed skill's internal wrapper as `python3 -B <this-skill-directory>/scripts/run_total.py YYYY-MM`. It resolves the checked-out repository and private profile without depending on the current working directory. This is an implementation detail; do not present the advanced external organize CLI as the normal user entry.
+- Use the existing ignored local profile and existing `NOTION_TOKEN` shell or `codex-notion-token` Keychain convention. Never ask the user to paste credentials, and never print or store the token.
+- The private profile must contain a `total` object with a fixed `view_id` and `fields` mapping for `done`, `categories`, `timeboxing`, and `date_anchor`. A relation-backed category may additionally use a private `category_relations` ID-to-name mapping. Do not commit or display any real values.
+- The adapter must use the stage 4 Views path and remain read-only. Do not use an ordinary database/data-source query, timestamp ordering, fallback ordering, approval, archive, cleanup, backup, or local state writes.
+- Return only category block subtotals in category-name order and the overlapping all-category total. For an empty result, say that no category blocks were recorded and show a zero total.
+- Treat invalid blocks and all config, API, paging, ordering, or field-contract failures as fail closed. Report only the adapter's sanitized error; never reveal item text, page titles, URLs, page IDs, view IDs, tokens, or raw diagnostics.
 
 ## Existing System Mode
 
