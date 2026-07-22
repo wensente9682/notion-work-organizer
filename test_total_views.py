@@ -1,8 +1,11 @@
 import unittest
 import copy
 import json
+import ssl
+import urllib.error
 from datetime import date
 from decimal import Decimal
+from unittest.mock import patch
 
 from total import TotalError
 from total_views import NotionViewsApi, TotalViewError, TotalViewFields, total_from_view
@@ -36,6 +39,20 @@ def page(*, anchor=None, done=True, categories=("Research",), timeboxing="2b"):
             },
         },
     }
+
+
+class JsonHttpResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class FakeViewsApi:
@@ -86,6 +103,1533 @@ class FakeViewsApi:
 
 
 class TotalFromViewTest(unittest.TestCase):
+    def test_nested_success_on_same_client_restores_outer_deadline_budget(self):
+        now = [0.0]
+        in_inner = [False]
+        outer_query_sent = [False]
+        timeouts = []
+        api = None
+
+        def opener(request, timeout):
+            nonlocal api
+            if request.method == "POST":
+                if in_inner[0]:
+                    timeouts.append(("inner-query", timeout))
+                    return JsonHttpResponse(
+                        {
+                            "object": "view_query",
+                            "id": "inner-query",
+                            "view_id": "view-example",
+                            "expires_at": "2026-07-17T08:00:00.000Z",
+                            "total_count": 0,
+                            "results": [],
+                            "next_cursor": None,
+                            "has_more": False,
+                            "request_status": {"type": "complete"},
+                        }
+                    )
+                outer_query_sent[0] = True
+                timeouts.append(("outer-query", timeout))
+                return JsonHttpResponse(
+                    {
+                        "object": "view_query",
+                        "id": "outer-query",
+                        "view_id": "view-example",
+                        "expires_at": "2026-07-17T08:00:00.000Z",
+                        "total_count": 2,
+                        "results": [{"object": "page", "id": "page-one"}],
+                        "next_cursor": "cursor-one",
+                        "has_more": True,
+                        "request_status": {"type": "complete"},
+                    }
+                )
+            if "/v1/pages/page-one" in request.full_url:
+                timeouts.append(("outer-page-one", timeout))
+                in_inner[0] = True
+                try:
+                    nested = total_from_view(
+                        api,
+                        view_id="view-example",
+                        target_month=date(2026, 7, 1),
+                        fields=FIELDS,
+                    )
+                finally:
+                    in_inner[0] = False
+                self.assertEqual({}, nested.totals)
+                now[0] = 179.0
+                row = page(anchor="2026-08-01", done=False, categories=())
+                row["id"] = "page-one"
+                return JsonHttpResponse(row)
+            if "/v1/pages/page-two" in request.full_url:
+                timeouts.append(("outer-page-two", timeout))
+                row = page(anchor="2026-06-30", done=False, categories=())
+                row["id"] = "page-two"
+                return JsonHttpResponse(row)
+            timeouts.append(("outer-pagination", timeout))
+            return JsonHttpResponse(
+                {
+                    "object": "list",
+                    "type": "page",
+                    "page": {},
+                    "results": [{"object": "page", "id": "page-two"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+            )
+
+        api = NotionViewsApi("token-example", opener=opener)
+        with patch("total_views.time.monotonic", side_effect=lambda: now[0]):
+            result = total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertTrue(outer_query_sent[0])
+        self.assertEqual({}, result.totals)
+        self.assertAlmostEqual(1.0, dict(timeouts)["outer-pagination"])
+        self.assertAlmostEqual(1.0, dict(timeouts)["outer-page-two"])
+
+    def test_nested_failure_on_same_client_restores_outer_attempt_budget(self):
+        references = [
+            {"object": "page", "id": f"page-{number:03d}"}
+            for number in range(1, 302)
+        ]
+        page_calls = []
+        in_inner = [False]
+        api = None
+
+        def page_of_results(start, end, *, cursor, has_more):
+            return {
+                "object": "list",
+                "type": "page",
+                "page": {},
+                "results": references[start:end],
+                "next_cursor": cursor,
+                "has_more": has_more,
+                "request_status": {"type": "complete"},
+            }
+
+        paginated = [
+            page_of_results(100, 200, cursor="cursor-two", has_more=True),
+            page_of_results(200, 300, cursor="cursor-three", has_more=True),
+            page_of_results(300, 301, cursor=None, has_more=False),
+        ]
+
+        def opener(request, timeout):
+            nonlocal api
+            if request.method == "POST":
+                if in_inner[0]:
+                    raise PermissionError("nested query failed")
+                return JsonHttpResponse(
+                    {
+                        "object": "view_query",
+                        "id": "outer-query",
+                        "view_id": "view-example",
+                        "expires_at": "2026-07-17T08:00:00.000Z",
+                        "total_count": 301,
+                        "results": references[:100],
+                        "next_cursor": "cursor-one",
+                        "has_more": True,
+                        "request_status": {"type": "complete"},
+                    }
+                )
+            if "/v1/pages/" not in request.full_url:
+                return JsonHttpResponse(paginated.pop(0))
+            page_id = request.full_url.rsplit("/", 1)[-1]
+            page_calls.append(page_id)
+            if page_id == "page-001":
+                in_inner[0] = True
+                try:
+                    with self.assertRaisesRegex(TotalViewError, "request failed"):
+                        total_from_view(
+                            api,
+                            view_id="view-example",
+                            target_month=date(2026, 7, 1),
+                            fields=FIELDS,
+                        )
+                finally:
+                    in_inner[0] = False
+            row = page(
+                anchor="2026-08-31" if page_id == "page-001" else None,
+                done=False,
+                categories=(),
+            )
+            row["id"] = page_id
+            return JsonHttpResponse(row)
+
+        api = NotionViewsApi("token-example", opener=opener)
+        with self.assertRaisesRegex(TotalViewError, "resource limit"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual(300, len(page_calls))
+        self.assertEqual("page-300", page_calls[-1])
+
+    def test_page_attempt_is_not_counted_when_deadline_expires_before_opener(self):
+        after_create = [False]
+        after_create_times = iter((179.0, 179.9, 180.0))
+        opener_calls = []
+
+        def clock():
+            return next(after_create_times) if after_create[0] else 0.0
+
+        class DeadlineEdgeApi(NotionViewsApi):
+            def __init__(self):
+                super().__init__("token-example", opener=self._open)
+                self.page_budget = None
+
+            def _open(self, request, timeout):
+                opener_calls.append((request, timeout))
+                raise AssertionError("expired attempt must not reach opener")
+
+            def create_view_query(self, view_id, *, page_size):
+                after_create[0] = True
+                return {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+
+            def retrieve_page(self, page_id):
+                self.page_budget = self._total_budget
+                return super().retrieve_page(page_id)
+
+        api = DeadlineEdgeApi()
+        with patch("total_views.time.monotonic", side_effect=clock):
+            with self.assertRaisesRegex(TotalViewError, "resource limit"):
+                total_from_view(
+                    api,
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+        self.assertEqual([], opener_calls)
+        self.assertIsNotNone(api.page_budget)
+        self.assertEqual(0, api.page_budget.page_get_attempts)
+
+    def test_page_attempt_count_includes_failed_network_calls_and_retries(self):
+        record = page(anchor="2026-07-31", done=False, categories=())
+        record["id"] = "page-example"
+
+        class AttemptApi(NotionViewsApi):
+            def __init__(self, outcomes):
+                self.outcomes = list(outcomes)
+                self.page_budget = None
+                self.opener_calls = 0
+                super().__init__("token-example", opener=self._open, sleeper=lambda _: None)
+
+            def _open(self, request, timeout):
+                self.opener_calls += 1
+                outcome = self.outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return JsonHttpResponse(outcome)
+
+            def create_view_query(self, view_id, *, page_size):
+                return {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+
+            def retrieve_page(self, page_id):
+                self.page_budget = self._total_budget
+                return super().retrieve_page(page_id)
+
+        non_transient = AttemptApi(
+            [
+                urllib.error.HTTPError(
+                    "https://example.invalid/private-page",
+                    400,
+                    "invalid",
+                    {},
+                    None,
+                )
+            ]
+        )
+        with self.assertRaisesRegex(TotalViewError, "page retrieve request failed"):
+            total_from_view(
+                non_transient,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+        self.assertEqual(1, non_transient.opener_calls)
+        self.assertEqual(1, non_transient.page_budget.page_get_attempts)
+
+        recovered = AttemptApi(
+            [
+                urllib.error.URLError(ssl.SSLEOFError("transient TLS EOF")),
+                record,
+            ]
+        )
+        result = total_from_view(
+            recovered,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+        self.assertEqual({}, result.totals)
+        self.assertEqual(2, recovered.opener_calls)
+        self.assertEqual(2, recovered.page_budget.page_get_attempts)
+
+    def test_month_scan_stops_after_query_exhausts_the_monotonic_deadline(self):
+        now = [0.0]
+
+        class SlowQueryApi:
+            def __init__(self):
+                self.calls = []
+
+            def create_view_query(self, view_id, *, page_size):
+                self.calls.append(("create", view_id, page_size))
+                now[0] = 180.0
+                return {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+
+            def retrieve_page(self, page_id):
+                self.calls.append(("retrieve", page_id))
+                raise AssertionError("deadline must stop before hydration")
+
+        api = SlowQueryApi()
+        with patch("total_views.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(TotalViewError, "resource limit"):
+                total_from_view(
+                    api,
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+        self.assertEqual([("create", "view-example", 100)], api.calls)
+
+    def test_month_scan_bounds_page_network_timeout_by_remaining_deadline(self):
+        now = [0.0]
+        timeouts = []
+        record = page(anchor="2026-07-31", timeboxing="1b")
+        record["id"] = "page-example"
+        responses = [
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "expires_at": "2026-07-17T08:00:00.000Z",
+                "total_count": 1,
+                "results": [{"object": "page", "id": "page-example"}],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            },
+            record,
+        ]
+
+        def opener(request, timeout):
+            timeouts.append(timeout)
+            response = responses.pop(0)
+            now[0] = 179.5 if request.method == "POST" else 180.0
+            return JsonHttpResponse(response)
+
+        with patch("total_views.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(TotalViewError, "resource limit"):
+                total_from_view(
+                    NotionViewsApi("token-example", opener=opener),
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+        self.assertEqual(30, timeouts[0])
+        self.assertAlmostEqual(0.5, timeouts[1])
+
+    def test_month_scan_counts_failed_page_attempt_before_blocking_its_retry(self):
+        page_calls = []
+        references = [
+            {"object": "page", "id": f"page-{number:03d}"}
+            for number in range(1, 301)
+        ]
+
+        def query_payload(start, end, *, cursor, has_more, initial=False):
+            payload = {
+                "object": "view_query" if initial else "list",
+                "id": "query-example" if initial else None,
+                "view_id": "view-example" if initial else None,
+                "total_count": 300 if initial else None,
+                "results": references[start:end],
+                "next_cursor": cursor,
+                "has_more": has_more,
+                "request_status": {"type": "complete"},
+            }
+            if initial:
+                payload["expires_at"] = "2026-07-17T08:00:00.000Z"
+            else:
+                payload["type"] = "page"
+                payload["page"] = {}
+                for key in ("id", "view_id", "total_count"):
+                    del payload[key]
+            return payload
+
+        paginated = [
+            query_payload(100, 200, cursor="cursor-two", has_more=True),
+            query_payload(200, 300, cursor=None, has_more=False),
+        ]
+
+        def opener(request, timeout):
+            if request.method == "POST":
+                return JsonHttpResponse(
+                    query_payload(
+                        0,
+                        100,
+                        cursor="cursor-one",
+                        has_more=True,
+                        initial=True,
+                    )
+                )
+            if "/v1/pages/" not in request.full_url:
+                return JsonHttpResponse(paginated.pop(0))
+            page_id = request.full_url.rsplit("/", 1)[-1]
+            page_calls.append(page_id)
+            if page_id == "page-300":
+                raise urllib.error.URLError(ssl.SSLEOFError("transient TLS EOF"))
+            row = page(
+                anchor="2026-07-31" if page_id == "page-001" else None,
+                done=False,
+                categories=(),
+            )
+            row["id"] = page_id
+            return JsonHttpResponse(row)
+
+        with self.assertRaisesRegex(TotalViewError, "resource limit"):
+            total_from_view(
+                NotionViewsApi("token-example", opener=opener, sleeper=lambda _: None),
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual(300, len(page_calls))
+        self.assertEqual("page-300", page_calls[-1])
+
+    def test_month_scan_does_not_sleep_or_retry_past_the_deadline(self):
+        now = [0.0]
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            if request.method == "POST":
+                now[0] = 179.0
+                return JsonHttpResponse(
+                    {
+                        "object": "view_query",
+                        "id": "query-example",
+                        "view_id": "view-example",
+                        "expires_at": "2026-07-17T08:00:00.000Z",
+                        "total_count": 1,
+                        "results": [{"object": "page", "id": "page-example"}],
+                        "next_cursor": None,
+                        "has_more": False,
+                        "request_status": {"type": "complete"},
+                    }
+                )
+            raise urllib.error.HTTPError(
+                "https://example.invalid/private-page",
+                429,
+                "rate limited",
+                {"Retry-After": "2"},
+                None,
+            )
+
+        with patch("total_views.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(TotalViewError, "resource limit"):
+                total_from_view(
+                    NotionViewsApi(
+                        "token-example",
+                        opener=opener,
+                        sleeper=sleeps.append,
+                    ),
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+        self.assertEqual(["POST", "GET"], [request.method for request in requests])
+        self.assertEqual([], sleeps)
+
+    def test_month_scan_does_not_back_off_past_the_deadline(self):
+        now = [0.0]
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            if request.method == "POST":
+                now[0] = 179.9
+                return JsonHttpResponse(
+                    {
+                        "object": "view_query",
+                        "id": "query-example",
+                        "view_id": "view-example",
+                        "expires_at": "2026-07-17T08:00:00.000Z",
+                        "total_count": 1,
+                        "results": [{"object": "page", "id": "page-example"}],
+                        "next_cursor": None,
+                        "has_more": False,
+                        "request_status": {"type": "complete"},
+                    }
+                )
+            raise urllib.error.URLError(ssl.SSLEOFError("transient TLS EOF"))
+
+        with patch("total_views.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(TotalViewError, "resource limit"):
+                total_from_view(
+                    NotionViewsApi(
+                        "token-example",
+                        opener=opener,
+                        sleeper=sleeps.append,
+                    ),
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+        self.assertEqual(["POST", "GET"], [request.method for request in requests])
+        self.assertEqual([], sleeps)
+
+    def test_month_scan_stops_when_pagination_exhausts_the_deadline(self):
+        now = [0.0]
+
+        class SlowPaginationApi:
+            def __init__(self):
+                self.calls = []
+
+            def create_view_query(self, view_id, *, page_size):
+                self.calls.append(("create", view_id, page_size))
+                return {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 2,
+                    "results": [{"object": "page", "id": "page-one"}],
+                    "next_cursor": "cursor-one",
+                    "has_more": True,
+                    "request_status": {"type": "complete"},
+                }
+
+            def retrieve_page(self, page_id):
+                self.calls.append(("retrieve", page_id))
+                now[0] = 179.0
+                row = page(anchor="2026-08-01", done=False, categories=())
+                row["id"] = page_id
+                return row
+
+            def get_view_query_results(
+                self,
+                view_id,
+                query_id,
+                cursor,
+                *,
+                page_size,
+            ):
+                self.calls.append(("results", view_id, query_id, cursor, page_size))
+                now[0] = 180.0
+                return {
+                    "object": "list",
+                    "type": "page",
+                    "page": {},
+                    "results": [{"object": "page", "id": "page-two"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+
+        api = SlowPaginationApi()
+        with patch("total_views.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(TotalViewError, "resource limit"):
+                total_from_view(
+                    api,
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+        self.assertEqual(
+            [
+                ("create", "view-example", 100),
+                ("retrieve", "page-one"),
+                ("results", "view-example", "query-example", "cursor-one", 100),
+            ],
+            api.calls,
+        )
+
+    def test_month_scan_fails_before_the_301st_page_get_attempt(self):
+        rows = [page(anchor="2026-08-31", done=False, categories=())]
+        rows.extend(page(done=False, categories=()) for _ in range(300))
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 301,
+                "results": rows[:100],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            },
+            pages=[
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": rows[100:200],
+                    "next_cursor": "cursor-two",
+                    "has_more": True,
+                    "request_status": {"type": "complete"},
+                },
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": rows[200:300],
+                    "next_cursor": "cursor-three",
+                    "has_more": True,
+                    "request_status": {"type": "complete"},
+                },
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": rows[300:],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                },
+            ],
+        )
+
+        with self.assertRaisesRegex(TotalViewError, "resource limit"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual(
+            300,
+            sum(call[0] == "retrieve" for call in api.calls),
+        )
+        self.assertNotIn(
+            ("results", "view-example", "query-example", "cursor-three", 100),
+            api.calls,
+        )
+
+    def test_month_scan_allows_the_300th_page_get_to_confirm_the_lower_boundary(self):
+        rows = [page(anchor="2026-07-31", done=False, categories=())]
+        rows.extend(page(done=False, categories=()) for _ in range(298))
+        rows.append(page(anchor="2026-06-30", done=False, categories=()))
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 300,
+                "results": rows[:100],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            },
+            pages=[
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": rows[100:200],
+                    "next_cursor": "cursor-two",
+                    "has_more": True,
+                    "request_status": {"type": "complete"},
+                },
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": rows[200:],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                },
+            ],
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({}, result.totals)
+        self.assertEqual(300, sum(call[0] == "retrieve" for call in api.calls))
+
+    def test_month_scan_rejects_missing_initial_request_status_before_retrieve(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 1,
+                "results": [page(anchor="2026-07-31")],
+                "next_cursor": None,
+                "has_more": False,
+            }
+        )
+
+        with self.assertRaisesRegex(TotalViewError, "not complete"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual([("create", "view-example", 100)], api.calls)
+
+    def test_month_scan_rejects_missing_paginated_status_before_that_page_retrieve(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 2,
+                "results": [page(anchor="2026-08-01")],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            },
+            pages=[
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": [page(anchor="2026-07-31")],
+                    "next_cursor": None,
+                    "has_more": False,
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(TotalViewError, "not complete"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual(
+            [
+                ("create", "view-example", 100),
+                ("retrieve", "page-example-1"),
+                ("results", "view-example", "query-example", "cursor-one", 100),
+            ],
+            api.calls,
+        )
+
+    def test_month_scan_stops_after_first_earlier_anchor_in_one_page(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 5,
+                "results": [
+                    page(anchor="2026-08-01", timeboxing="not-a-block"),
+                    page(anchor="2026-07-31", timeboxing="1b"),
+                    page(anchor=None, timeboxing="2b"),
+                    page(anchor="2026-06-30", timeboxing="99b"),
+                    page(anchor="2026-07-01", timeboxing="100b"),
+                ],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("3")}, result.totals)
+        self.assertEqual((), result.invalid_blocks)
+        self.assertEqual(
+            [
+                ("create", "view-example", 100),
+                ("retrieve", "page-example-1"),
+                ("retrieve", "page-example-2"),
+                ("retrieve", "page-example-3"),
+                ("retrieve", "page-example-4"),
+            ],
+            api.calls,
+        )
+
+    def test_month_scan_rejects_a_repeated_cursor_before_hydrating_its_page(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 3,
+                "results": [page(anchor="2026-08-01")],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            },
+            pages=[
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": [page(anchor="2026-06-30")],
+                    "next_cursor": "cursor-one",
+                    "has_more": True,
+                    "request_status": {"type": "complete"},
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(TotalViewError, "repeated cursor"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual(
+            [
+                ("create", "view-example", 100),
+                ("retrieve", "page-example-1"),
+                ("results", "view-example", "query-example", "cursor-one", 100),
+            ],
+            api.calls,
+        )
+
+    def test_month_scan_rejects_more_results_after_total_count_is_reached(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 1,
+                "results": [page(anchor="2026-06-30")],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        with self.assertRaisesRegex(TotalViewError, "result count"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual([("create", "view-example", 100)], api.calls)
+
+    def test_month_scan_keeps_target_inheritance_across_pages_and_stops_paging(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 6,
+                "results": [
+                    page(anchor="2026-08-01"),
+                    page(anchor="2026-07-31", timeboxing="1b"),
+                ],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            },
+            pages=[
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": [
+                        page(anchor=None, timeboxing="2b"),
+                        page(anchor="2026-06-30"),
+                        page(anchor=None, timeboxing="100b"),
+                    ],
+                    "next_cursor": "cursor-two",
+                    "has_more": True,
+                    "request_status": {"type": "complete"},
+                },
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": [page(anchor="2026-05-31")],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                },
+            ],
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("3")}, result.totals)
+        self.assertEqual(
+            [
+                ("create", "view-example", 100),
+                ("retrieve", "page-example-1"),
+                ("retrieve", "page-example-2"),
+                ("results", "view-example", "query-example", "cursor-one", 100),
+                ("retrieve", "page-example-3"),
+                ("retrieve", "page-example-4"),
+            ],
+            api.calls,
+        )
+
+    def test_month_scan_returns_empty_when_ordered_anchors_cross_the_target(self):
+        for rows in (
+            [page(anchor="2026-08-01"), page(anchor="2026-06-30")],
+            [page(done=False, categories=()), page(anchor="2026-06-30")],
+        ):
+            with self.subTest(rows=len(rows)):
+                api = FakeViewsApi(
+                    {
+                        "object": "view_query",
+                        "id": "query-example",
+                        "view_id": "view-example",
+                        "total_count": len(rows),
+                        "results": rows,
+                        "next_cursor": None,
+                        "has_more": False,
+                        "request_status": {"type": "complete"},
+                    }
+                )
+
+                result = total_from_view(
+                    api,
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+                self.assertEqual({}, result.totals)
+                self.assertEqual((), result.invalid_blocks)
+
+    def test_month_scan_accepts_a_complete_terminal_page_as_the_lower_boundary(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 2,
+                "results": [
+                    page(anchor="2026-07-31", timeboxing="1b"),
+                    page(anchor=None, timeboxing="2b"),
+                ],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("3")}, result.totals)
+
+    def test_month_scan_allows_an_empty_view_but_rejects_nonempty_without_an_anchor(self):
+        empty = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 0,
+                "results": [],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+        no_anchor = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 1,
+                "results": [page(done=False, categories=())],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        self.assertEqual(
+            {},
+            total_from_view(
+                empty,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            ).totals,
+        )
+        with self.assertRaisesRegex(TotalViewError, "no structured date anchor"):
+            total_from_view(
+                no_anchor,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+    def test_month_scan_reports_invalid_blocks_only_inside_the_target_interval(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 3,
+                "results": [
+                    page(anchor="2026-08-01", timeboxing="later-invalid"),
+                    page(anchor="2026-07-31", timeboxing="target-invalid"),
+                    page(anchor="2026-06-30", timeboxing="earlier-invalid"),
+                ],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({}, result.totals)
+        self.assertEqual(1, len(result.invalid_blocks))
+        self.assertEqual(1, result.invalid_blocks[0].row_index)
+        self.assertEqual("target-invalid", result.invalid_blocks[0].value)
+
+    def test_month_scan_preserves_invalid_block_row_index_across_newer_page_prefix(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 5,
+                "results": [
+                    page(anchor="2026-08-01", done=False, categories=()),
+                    page(anchor=None, timeboxing="later-invalid"),
+                ],
+                "next_cursor": "cursor-one",
+                "has_more": True,
+                "request_status": {"type": "complete"},
+            },
+            pages=[
+                {
+                    "object": "list",
+                    "type": "page",
+                    "results": [
+                        page(anchor="2026-07-31", timeboxing="target-invalid"),
+                        page(anchor="2026-06-30"),
+                        page(anchor="2026-07-01"),
+                    ],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+            ],
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual(1, len(result.invalid_blocks))
+        self.assertEqual(2, result.invalid_blocks[0].row_index)
+        self.assertEqual("target-invalid", result.invalid_blocks[0].value)
+        self.assertNotIn(("retrieve", "page-example-5"), api.calls)
+
+    def test_month_scan_preserves_countable_item_before_first_anchor_failure(self):
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 2,
+                "results": [
+                    page(anchor=None, timeboxing="1b"),
+                    page(anchor="2026-06-30"),
+                ],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        with self.assertRaisesRegex(TotalError, "before first date anchor"):
+            total_from_view(
+                api,
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+    def test_page_get_recovers_from_a_tls_eof(self):
+        record = page(anchor="2026-07-03", done=True, timeboxing="2b")
+        record["id"] = "page-example"
+        outcomes = [
+            JsonHttpResponse(
+                {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+            ),
+            urllib.error.URLError(ssl.SSLEOFError("transient TLS EOF")),
+            JsonHttpResponse(record),
+        ]
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        result = total_from_view(
+            NotionViewsApi(
+                "token-example",
+                opener=opener,
+                sleeper=sleeps.append,
+            ),
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("2")}, result.totals)
+        self.assertEqual(["POST", "GET", "GET"], [request.method for request in requests])
+        self.assertEqual(1, len(sleeps))
+
+    def test_page_get_recovers_from_connection_reset_and_timeout(self):
+        for transport_error in (ConnectionResetError("reset"), TimeoutError("timeout")):
+            with self.subTest(error=type(transport_error).__name__):
+                record = page(anchor="2026-07-03", done=True, timeboxing="2b")
+                record["id"] = "page-example"
+                outcomes = [
+                    JsonHttpResponse(
+                        {
+                            "object": "view_query",
+                            "id": "query-example",
+                            "view_id": "view-example",
+                            "expires_at": "2026-07-17T08:00:00.000Z",
+                            "total_count": 1,
+                            "results": [{"object": "page", "id": "page-example"}],
+                            "next_cursor": None,
+                            "has_more": False,
+                            "request_status": {"type": "complete"},
+                        }
+                    ),
+                    transport_error,
+                    JsonHttpResponse(record),
+                ]
+                requests = []
+                sleeps = []
+
+                def opener(request, timeout):
+                    requests.append(request)
+                    outcome = outcomes.pop(0)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                result = total_from_view(
+                    NotionViewsApi(
+                        "token-example",
+                        opener=opener,
+                        sleeper=sleeps.append,
+                    ),
+                    view_id="view-example",
+                    target_month=date(2026, 7, 1),
+                    fields=FIELDS,
+                )
+
+                self.assertEqual({"Research": Decimal("2")}, result.totals)
+                self.assertEqual(["POST", "GET", "GET"], [request.method for request in requests])
+                self.assertEqual(1, len(sleeps))
+
+    def test_page_get_honors_a_bounded_retry_after_for_429(self):
+        record = page(anchor="2026-07-03", done=True, timeboxing="2b")
+        record["id"] = "page-example"
+        outcomes = [
+            JsonHttpResponse(
+                {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+            ),
+            urllib.error.HTTPError(
+                "https://example.invalid/private-page",
+                429,
+                "rate limited",
+                {"Retry-After": "2"},
+                None,
+            ),
+            JsonHttpResponse(record),
+        ]
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        result = total_from_view(
+            NotionViewsApi(
+                "token-example",
+                opener=opener,
+                sleeper=sleeps.append,
+            ),
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("2")}, result.totals)
+        self.assertEqual(["POST", "GET", "GET"], [request.method for request in requests])
+        self.assertEqual([2], sleeps)
+
+    def test_page_get_recovers_from_a_retryable_503(self):
+        record = page(anchor="2026-07-03", done=True, timeboxing="2b")
+        record["id"] = "page-example"
+        outcomes = [
+            JsonHttpResponse(
+                {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+            ),
+            urllib.error.HTTPError(
+                "https://example.invalid/private-page",
+                503,
+                "temporarily unavailable",
+                {},
+                None,
+            ),
+            JsonHttpResponse(record),
+        ]
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        result = total_from_view(
+            NotionViewsApi(
+                "token-example",
+                opener=opener,
+                sleeper=sleeps.append,
+            ),
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("2")}, result.totals)
+        self.assertEqual(["POST", "GET", "GET"], [request.method for request in requests])
+        self.assertEqual(1, len(sleeps))
+
+    def test_page_get_transient_failures_stop_after_three_sanitized_attempts(self):
+        for failure_kind in ("tls", "503"):
+            with self.subTest(failure_kind=failure_kind):
+                def transient_error():
+                    if failure_kind == "tls":
+                        return urllib.error.URLError(
+                            ssl.SSLEOFError("private-page-id private task content")
+                        )
+                    return urllib.error.HTTPError(
+                        "https://example.invalid/private-page-id",
+                        503,
+                        "private task content",
+                        {},
+                        None,
+                    )
+
+                outcomes = [
+                    JsonHttpResponse(
+                        {
+                            "object": "view_query",
+                            "id": "query-example",
+                            "view_id": "view-example",
+                            "expires_at": "2026-07-17T08:00:00.000Z",
+                            "total_count": 1,
+                            "results": [{"object": "page", "id": "page-example"}],
+                            "next_cursor": None,
+                            "has_more": False,
+                            "request_status": {"type": "complete"},
+                        }
+                    ),
+                    transient_error(),
+                    transient_error(),
+                    transient_error(),
+                ]
+                requests = []
+                sleeps = []
+
+                def opener(request, timeout):
+                    requests.append(request)
+                    outcome = outcomes.pop(0)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                with self.assertRaises(TotalViewError) as caught:
+                    total_from_view(
+                        NotionViewsApi(
+                            "private-token",
+                            opener=opener,
+                            sleeper=sleeps.append,
+                        ),
+                        view_id="view-example",
+                        target_month=date(2026, 7, 1),
+                        fields=FIELDS,
+                    )
+
+                self.assertEqual("page retrieve request failed", str(caught.exception))
+                self.assertEqual(["POST", "GET", "GET", "GET"], [request.method for request in requests])
+                self.assertEqual(2, len(sleeps))
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_page_get_does_not_retry_a_non_transient_400(self):
+        outcomes = [
+            JsonHttpResponse(
+                {
+                    "object": "view_query",
+                    "id": "query-example",
+                    "view_id": "view-example",
+                    "expires_at": "2026-07-17T08:00:00.000Z",
+                    "total_count": 1,
+                    "results": [{"object": "page", "id": "page-example"}],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "request_status": {"type": "complete"},
+                }
+            ),
+            urllib.error.HTTPError(
+                "https://example.invalid/private-page",
+                400,
+                "private request detail",
+                {},
+                None,
+            ),
+        ]
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with self.assertRaisesRegex(TotalViewError, "page retrieve request failed"):
+            total_from_view(
+                NotionViewsApi(
+                    "private-token",
+                    opener=opener,
+                    sleeper=sleeps.append,
+                ),
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=FIELDS,
+            )
+
+        self.assertEqual(["POST", "GET"], [request.method for request in requests])
+        self.assertEqual([], sleeps)
+
+    def test_initial_query_post_is_never_retried(self):
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            raise urllib.error.URLError(ssl.SSLEOFError("transient TLS EOF"))
+
+        with self.assertRaisesRegex(TotalViewError, "view query request failed"):
+            NotionViewsApi(
+                "token-example",
+                opener=opener,
+                sleeper=sleeps.append,
+            ).create_view_query("view-example", page_size=100)
+
+        self.assertEqual(["POST"], [request.method for request in requests])
+        self.assertEqual([], sleeps)
+
+    def test_query_results_get_is_never_retried(self):
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            raise urllib.error.URLError(ssl.SSLEOFError("transient TLS EOF"))
+
+        with self.assertRaisesRegex(TotalViewError, "view query request failed"):
+            NotionViewsApi(
+                "token-example",
+                opener=opener,
+                sleeper=sleeps.append,
+            ).get_view_query_results(
+                "view-example",
+                "query-example",
+                "cursor-example",
+                page_size=100,
+            )
+
+        self.assertEqual(["GET"], [request.method for request in requests])
+        self.assertEqual([], sleeps)
+
+    def test_page_get_uses_bounded_backoff_for_unsafe_retry_after(self):
+        for retry_after in (
+            "6",
+            "-1",
+            "",
+            " 2 ",
+            "2.5",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ):
+            with self.subTest(retry_after=retry_after):
+                record = page(anchor="2026-07-03", done=True, timeboxing="2b")
+                record["id"] = "page-example"
+                outcomes = [
+                    urllib.error.HTTPError(
+                        "https://example.invalid/private-page",
+                        429,
+                        "rate limited",
+                        {"Retry-After": retry_after},
+                        None,
+                    ),
+                    JsonHttpResponse(record),
+                ]
+                sleeps = []
+
+                def opener(request, timeout):
+                    outcome = outcomes.pop(0)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                response = NotionViewsApi(
+                    "token-example",
+                    opener=opener,
+                    sleeper=sleeps.append,
+                ).retrieve_page("page-example")
+
+                self.assertEqual("page-example", response["id"])
+                self.assertEqual([0.25], sleeps)
+
+    def test_page_get_uses_bounded_backoff_for_very_long_numeric_retry_after(self):
+        record = page(anchor="2026-07-03", done=True, timeboxing="2b")
+        record["id"] = "page-example"
+        outcomes = [
+            urllib.error.HTTPError(
+                "https://example.invalid/private-page",
+                429,
+                "rate limited",
+                {"Retry-After": "9" * 5000},
+                None,
+            ),
+            JsonHttpResponse(record),
+        ]
+        sleeps = []
+
+        def opener(request, timeout):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        response = NotionViewsApi(
+            "token-example",
+            opener=opener,
+            sleeper=sleeps.append,
+        ).retrieve_page("page-example")
+
+        self.assertEqual("page-example", response["id"])
+        self.assertEqual([0.25], sleeps)
+
     def test_initial_query_requires_valid_expires_at(self):
         base = {
             "object": "view_query",
@@ -138,7 +1682,7 @@ class TotalFromViewTest(unittest.TestCase):
             "object": "view_query",
             "id": "query-example",
             "view_id": "view-example",
-            "total_count": 0,
+            "total_count": 1,
             "results": [],
             "next_cursor": "cursor-one",
             "has_more": True,
@@ -148,7 +1692,7 @@ class TotalFromViewTest(unittest.TestCase):
             "object": "list",
             "type": "page",
             "page": {},
-            "results": [],
+            "results": [page(anchor="2026-07-03")],
             "next_cursor": None,
             "has_more": False,
             "request_status": {"type": "complete"},
@@ -320,9 +1864,9 @@ class TotalFromViewTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("create", "view-example", 100),
-                ("results", "view-example", "query-example", "cursor-one", 100),
                 ("retrieve", "page-example-1"),
                 ("retrieve", "page-example-2"),
+                ("results", "view-example", "query-example", "cursor-one", 100),
                 ("retrieve", "page-example-3"),
             ],
             api.calls,
@@ -586,7 +2130,7 @@ class TotalFromViewTest(unittest.TestCase):
                 "request_status": {"type": "complete"},
             }
         )
-        with self.assertRaisesRegex(TotalError, "before first date anchor"):
+        with self.assertRaisesRegex(TotalViewError, "no structured date anchor"):
             total_from_view(
                 text_api,
                 view_id="view-example",
@@ -915,6 +2459,7 @@ class TotalFromViewTest(unittest.TestCase):
                 "has_more": True,
                 "request_status": {"type": "complete"},
             },
+            anchor_record,
             {
                 "object": "list",
                 "type": "page",
@@ -924,7 +2469,6 @@ class TotalFromViewTest(unittest.TestCase):
                 "has_more": False,
                 "request_status": {"type": "complete"},
             },
-            anchor_record,
             work_record,
         ]
         requests = []
@@ -964,12 +2508,12 @@ class TotalFromViewTest(unittest.TestCase):
         )
         self.assertEqual({"page_size": 100}, json.loads(requests[0].data))
         self.assertEqual(
-            "https://api.notion.com/v1/views/view-example/queries/query-example"
-            "?start_cursor=cursor-one&page_size=100",
+            "https://api.notion.com/v1/pages/page-anchor",
             requests[1].full_url,
         )
         self.assertEqual(
-            "https://api.notion.com/v1/pages/page-anchor",
+            "https://api.notion.com/v1/views/view-example/queries/query-example"
+            "?start_cursor=cursor-one&page_size=100",
             requests[2].full_url,
         )
         self.assertEqual(
