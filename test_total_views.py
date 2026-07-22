@@ -55,6 +55,42 @@ class JsonHttpResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class FakePersistentHttpResponse(JsonHttpResponse):
+    status = 200
+    reason = "OK"
+    headers = {}
+    will_close = False
+
+    def close(self):
+        return None
+
+
+class FailingReadHttpResponse(FakePersistentHttpResponse):
+    def read(self):
+        raise ConnectionResetError("dropped while reading")
+
+
+class FakeHttpsConnection:
+    def __init__(self, responses, timeout):
+        self.responses = responses
+        self.timeout = timeout
+        self.sock = None
+        self.requests = []
+        self.closed = False
+
+    def request(self, method, path, body=None, headers=None):
+        self.requests.append((method, path, body, headers))
+
+    def getresponse(self):
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def close(self):
+        self.closed = True
+
+
 class FakeViewsApi:
     def __init__(self, initial, pages=(), *, add_expires=True):
         self.records = {}
@@ -103,6 +139,99 @@ class FakeViewsApi:
 
 
 class TotalFromViewTest(unittest.TestCase):
+    def test_default_transport_reuses_one_https_connection_for_sequential_reads(self):
+        responses = [
+            FakePersistentHttpResponse({"object": "view_query"}),
+            FakePersistentHttpResponse({"object": "page", "id": "page-example"}),
+        ]
+        connections = []
+
+        def connection_factory(host, port=None, timeout=None):
+            connection = FakeHttpsConnection(responses, timeout)
+            connections.append(connection)
+            return connection
+
+        api = NotionViewsApi(
+            "token-example",
+            connection_factory=connection_factory,
+        )
+
+        self.assertEqual(
+            {"object": "view_query"},
+            api.create_view_query("view-example", page_size=100),
+        )
+        self.assertEqual(
+            {"object": "page", "id": "page-example"},
+            api.retrieve_page("page-example"),
+        )
+        self.assertEqual(1, len(connections))
+        self.assertEqual(
+            ["POST", "GET"],
+            [request[0] for request in connections[0].requests],
+        )
+
+    def test_default_transport_rebuilds_a_dropped_persistent_connection(self):
+        response_batches = [
+            [
+                FakePersistentHttpResponse({"object": "view_query"}),
+                ConnectionResetError("dropped"),
+            ],
+            [FakePersistentHttpResponse({"object": "page", "id": "page-example"})],
+        ]
+        connections = []
+        sleeps = []
+
+        def connection_factory(host, port=None, timeout=None):
+            connection = FakeHttpsConnection(response_batches.pop(0), timeout)
+            connections.append(connection)
+            return connection
+
+        api = NotionViewsApi(
+            "token-example",
+            connection_factory=connection_factory,
+            sleeper=sleeps.append,
+        )
+        api.create_view_query("view-example", page_size=100)
+
+        self.assertEqual(
+            {"object": "page", "id": "page-example"},
+            api.retrieve_page("page-example"),
+        )
+        self.assertEqual(2, len(connections))
+        self.assertTrue(connections[0].closed)
+        self.assertEqual([0.25], sleeps)
+
+    def test_default_transport_rebuilds_when_the_response_body_disconnects(self):
+        response_batches = [
+            [
+                FakePersistentHttpResponse({"object": "view_query"}),
+                FailingReadHttpResponse({}),
+            ],
+            [FakePersistentHttpResponse({"object": "page", "id": "page-example"})],
+        ]
+        connections = []
+        sleeps = []
+
+        def connection_factory(host, port=None, timeout=None):
+            connection = FakeHttpsConnection(response_batches.pop(0), timeout)
+            connections.append(connection)
+            return connection
+
+        api = NotionViewsApi(
+            "token-example",
+            connection_factory=connection_factory,
+            sleeper=sleeps.append,
+        )
+        api.create_view_query("view-example", page_size=100)
+
+        self.assertEqual(
+            {"object": "page", "id": "page-example"},
+            api.retrieve_page("page-example"),
+        )
+        self.assertEqual(2, len(connections))
+        self.assertTrue(connections[0].closed)
+        self.assertEqual([0.25], sleeps)
+
     def test_nested_success_on_same_client_restores_outer_deadline_budget(self):
         now = [0.0]
         in_inner = [False]

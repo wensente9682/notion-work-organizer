@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
+import http.client
+import io
 import json
 import ssl
 import time
@@ -20,6 +22,92 @@ class TotalViewError(TotalError):
 
 class _TotalResourceLimit(TotalViewError):
     pass
+
+
+class _PersistentHttpsOpener:
+    def __init__(self, connection_factory: Any) -> None:
+        self._connection_factory = connection_factory
+        self._connection: Any = None
+        self._origin: tuple[str, int | None] | None = None
+
+    def _reset(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+        self._connection = None
+        self._origin = None
+
+    def __call__(
+        self,
+        request: urllib.request.Request,
+        *,
+        timeout: float,
+    ) -> Any:
+        parsed = urllib.parse.urlsplit(request.full_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "api.notion.com"
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise urllib.error.URLError("unsupported HTTPS origin")
+        origin = (parsed.hostname, parsed.port)
+        if self._connection is None or self._origin != origin:
+            self._reset()
+            self._connection = self._connection_factory(
+                parsed.hostname,
+                parsed.port,
+                timeout=timeout,
+            )
+            self._origin = origin
+        else:
+            self._connection.timeout = timeout
+            if self._connection.sock is not None:
+                self._connection.sock.settimeout(timeout)
+        path = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
+        response = None
+        try:
+            self._connection.request(
+                request.method,
+                path,
+                body=request.data,
+                headers=dict(request.header_items()),
+            )
+            response = self._connection.getresponse()
+            status = response.status
+            reason = response.reason
+            headers = response.headers
+            will_close = response.will_close
+            payload = response.read()
+            response.close()
+        except (TimeoutError, ConnectionResetError, ssl.SSLEOFError):
+            if response is not None:
+                response.close()
+            self._reset()
+            raise
+        except (
+            BrokenPipeError,
+            http.client.HTTPException,
+        ) as exc:
+            if response is not None:
+                response.close()
+            self._reset()
+            raise ConnectionResetError("persistent HTTPS connection failed") from exc
+        except OSError as exc:
+            if response is not None:
+                response.close()
+            self._reset()
+            raise urllib.error.URLError(exc) from exc
+        if will_close or status >= 400:
+            self._reset()
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                reason,
+                headers,
+                io.BytesIO(payload),
+            )
+        return io.BytesIO(payload)
 
 
 @dataclass
@@ -58,9 +146,18 @@ class _TotalScanBudget:
 
 
 class NotionViewsApi:
-    def __init__(self, token: str, *, opener: Any = None, sleeper: Any = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        opener: Any = None,
+        sleeper: Any = None,
+        connection_factory: Any = None,
+    ) -> None:
         self._token = token
-        self._opener = opener or urllib.request.urlopen
+        self._opener = opener or _PersistentHttpsOpener(
+            connection_factory or http.client.HTTPSConnection
+        )
         self._sleeper = sleeper or time.sleep
         self._total_budget: _TotalScanBudget | None = None
 
