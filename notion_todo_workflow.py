@@ -446,6 +446,13 @@ def read_text(prop: dict[str, Any]) -> str:
     if prop_type == "select":
         selected = prop.get("select")
         return "" if selected is None else selected.get("name", "")
+    if prop_type == "status":
+        selected = prop.get("status")
+        if selected is None:
+            return ""
+        if not isinstance(selected, dict) or not isinstance(selected.get("name"), str):
+            raise WorkflowError("Category status payload is malformed.")
+        return selected["name"]
     if prop_type == "multi_select":
         return ", ".join(item.get("name", "") for item in prop.get("multi_select", []))
     if prop_type == "url":
@@ -799,7 +806,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if mode not in {TEST_MODE, REAL_MODE}:
         raise WorkflowError("config mode must be `test` or `real`")
     if mode == REAL_MODE:
-        required = ["source_database_id", "archive_tables_page_id", "archive_tables", "project_categories"]
+        required = ["source_database_id", "archive_tables_page_id", "archive_tables"]
     else:
         required = ["source_database_id", "target_databases"]
     missing = [key for key in required if key not in config]
@@ -884,17 +891,36 @@ def require_props(db: dict[str, Any], expected: dict[str, str], label: str) -> N
         raise WorkflowError(f"{label} schema mismatch: " + "; ".join(problems))
 
 
+def require_real_source_props(db: dict[str, Any], config: dict[str, Any]) -> None:
+    fields = field_mapping(config)
+    props = db.get("properties", {})
+    expected = source_schema_expectations(config, "")
+    problems = []
+    for name, prop_type in expected.items():
+        if name == fields["category"]:
+            continue
+        actual = props.get(name, {}).get("type")
+        if actual != prop_type:
+            problems.append(f"{name} expected {prop_type}, got {actual or 'missing'}")
+    category_type = props.get(fields["category"], {}).get("type")
+    supported = {"rich_text", "relation", "select", "multi_select", "status"}
+    if category_type not in supported:
+        problems.append(f"{fields['category']} has an unsupported type")
+    if category_type == "relation":
+        mappings = config.get("project_categories")
+        if not isinstance(mappings, dict) or not mappings:
+            problems.append("relation Category requires project_categories mapping")
+    if problems:
+        raise WorkflowError("source schema mismatch: " + "; ".join(problems))
+
+
 def preflight(config: dict[str, Any], *, force: bool = False, cache_path: Path = Path(DEFAULT_CACHE)) -> None:
     if not force and preflight_cache_fresh(config, cache_path):
         return
     ensure_notion_cooldown_clear(cache_path)
     client = get_client(config.get("source_order", "bottom_first"))
     if config_mode(config) == REAL_MODE:
-        require_props(
-            client.retrieve_database(notion_id(config["source_database_id"])),
-            source_schema_expectations(config, "relation"),
-            "source",
-        )
+        require_real_source_props(client.retrieve_database(notion_id(config["source_database_id"])), config)
         archive_tables = config.get("archive_tables") or {}
         missing_tables = [category for category in config.get("project_categories", {}) if category not in archive_tables]
         if missing_tables:
@@ -1236,16 +1262,52 @@ def real_category_lookup(config: dict[str, Any]) -> dict[str, str]:
 def real_candidate_from_notion_page(page: dict[str, Any], config: dict[str, Any]) -> Candidate:
     props = page.get("properties", {})
     fields = field_mapping(config)
-    lookup = real_category_lookup(config)
-    relation_ids = read_relation_ids(props.get(fields["category"], {}))
-    category_options = [lookup[relation_id] for relation_id in relation_ids if relation_id in lookup]
-    unknown = [relation_id for relation_id in relation_ids if relation_id not in lookup]
-    category_labels = category_options + [f"unknown:{item[:8]}" for item in unknown]
+    category_prop = props.get(fields["category"], {})
+    category_type = category_prop.get("type")
+    if category_type == "relation":
+        lookup = real_category_lookup(config)
+        relation_ids = read_relation_ids(category_prop)
+        unknown = [relation_id for relation_id in relation_ids if relation_id not in lookup]
+        if unknown:
+            raise WorkflowError("Category relation is not mapped to an archive target.")
+        category_options = [lookup[relation_id] for relation_id in relation_ids]
+    elif category_type == "multi_select":
+        selected = category_prop.get("multi_select")
+        if not isinstance(selected, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not item["name"].strip()
+            for item in selected
+        ):
+            raise WorkflowError("Category multi-select payload is malformed.")
+        category_options = [item["name"] for item in selected]
+    elif category_type in {"status", "select"}:
+        key = category_type
+        if key not in category_prop:
+            raise WorkflowError("Category structured payload is malformed.")
+        selected = category_prop[key]
+        if (
+            not isinstance(selected, dict)
+            or not isinstance(selected.get("name"), str)
+            or not selected["name"].strip()
+        ):
+            raise WorkflowError("Category structured payload is malformed.")
+        category_options = [selected["name"]]
+    elif category_type == "rich_text":
+        value = read_text(category_prop).strip()
+        category_options = [value] if value else []
+    else:
+        raise WorkflowError("Category field has an unsupported structured type.")
+    if not category_options:
+        raise WorkflowError("Category is empty or unresolved.")
+    mapped = set(config.get("archive_tables", {}))
+    if not set(category_options).issubset(mapped):
+        raise WorkflowError("Category is not mapped to an archive target.")
     return Candidate(
         source_page_id=page["id"],
         source_url=page.get("url", ""),
         name=read_title(props.get(fields["task"], {})),
-        category=" + ".join(category_labels),
+        category=" + ".join(category_options),
         learnings=read_text(props.get(fields["takeaway"], {})).strip(),
         improvements=read_text(props.get(fields["improvement"], {})).strip(),
         created_time=page.get("created_time", ""),
@@ -2040,7 +2102,7 @@ def make_preview_batch(config: dict[str, Any], state: dict[str, Any], limit: int
     client = get_client(config.get("source_order", "bottom_first"))
     source_id = notion_id(config["source_database_id"])
     if config_mode(config) == REAL_MODE:
-        target_categories = set(config.get("project_categories", {}).keys())
+        target_categories = set(config.get("archive_tables", {}).keys())
     else:
         target_categories = set(config["target_databases"].keys())
     already_handled = (

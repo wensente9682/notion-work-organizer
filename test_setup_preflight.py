@@ -112,6 +112,47 @@ class SetupPreflightTest(unittest.TestCase):
 
         self.assertEqual([], findings)
 
+    def test_real_status_category_uses_archive_names_without_relation_mapping(self):
+        cfg = english_config()
+        cfg.update(
+            {
+                "mode": "real",
+                "archive_tables_page_id": "archive-page",
+                "archive_tables": {"Research": "Research"},
+            }
+        )
+        cfg.pop("target_databases")
+        schema = english_schema()
+        schema["source"]["properties"]["Category"] = {"type": "status"}
+
+        findings = setup_preflight.validate_config(cfg)
+        findings.extend(setup_preflight.validate_schema(schema, cfg))
+
+        self.assertEqual([], findings)
+
+    def test_real_relation_category_still_requires_private_relation_mapping(self):
+        cfg = english_config()
+        cfg.update(
+            {
+                "mode": "real",
+                "archive_tables_page_id": "archive-page",
+                "archive_tables": {"Research": "Research"},
+            }
+        )
+        cfg.pop("target_databases")
+        schema = english_schema()
+        schema["source"]["properties"]["Category"] = {"type": "relation"}
+
+        findings = setup_preflight.validate_schema(schema, cfg)
+
+        self.assertTrue(
+            any(
+                finding.code == "config.mapping"
+                and "project_categories" in finding.message
+                for finding in findings
+            )
+        )
+
     def test_missing_fields_fake_schema_reports_errors(self):
         schema = complete_schema()
         del schema["source"]["properties"]["收获"]

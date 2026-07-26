@@ -2480,13 +2480,46 @@ class TotalFromViewTest(unittest.TestCase):
             ).totals,
         )
 
+    def test_status_category_uses_its_visible_name_for_totals(self):
+        row = page(anchor="2026-07-03", done=True, timeboxing="2b")
+        row["properties"]["Category"] = {
+            "type": "status",
+            "status": {"name": "Research"},
+        }
+        api = FakeViewsApi(
+            {
+                "object": "view_query",
+                "id": "query-example",
+                "view_id": "view-example",
+                "total_count": 1,
+                "results": [row],
+                "next_cursor": None,
+                "has_more": False,
+                "request_status": {"type": "complete"},
+            }
+        )
+
+        result = total_from_view(
+            api,
+            view_id="view-example",
+            target_month=date(2026, 7, 1),
+            fields=FIELDS,
+        )
+
+        self.assertEqual({"Research": Decimal("2")}, result.totals)
+        self.assertEqual((), result.invalid_blocks)
+
     def test_unsupported_or_malformed_category_payload_fails_closed(self):
         malformed_properties = [
-            {"type": "status", "status": {"name": "Research"}},
             {"type": "multi_select"},
             {"type": "multi_select", "multi_select": "Research"},
             {"type": "multi_select", "multi_select": [{}]},
             {"type": "multi_select", "multi_select": ["Research"]},
+            {"type": "status"},
+            {"type": "status", "status": None},
+            {"type": "status", "status": "private-category"},
+            {"type": "status", "status": {}},
+            {"type": "status", "status": {"name": "   "}},
         ]
         for category_property in malformed_properties:
             row = page(anchor="2026-07-03", done=True, timeboxing="2b")
@@ -2502,13 +2535,14 @@ class TotalFromViewTest(unittest.TestCase):
                 "request_status": {"type": "complete"},
             }
             with self.subTest(category=category_property):
-                with self.assertRaisesRegex(TotalViewError, "category field"):
+                with self.assertRaisesRegex(TotalViewError, "category field") as raised:
                     total_from_view(
                         FakeViewsApi(response),
                         view_id="view-example",
                         target_month=date(2026, 7, 1),
                         fields=FIELDS,
                     )
+                self.assertNotIn("private-category", str(raised.exception))
 
     def test_supported_empty_category_payloads_are_ignored(self):
         select_empty = page(anchor="2026-07-03", done=True, timeboxing="not a block")

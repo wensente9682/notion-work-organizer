@@ -94,7 +94,12 @@ For real profiles that use a relation property, category names map to project pa
 }
 ```
 
-The category relation routes the source row only. It should not be copied into archive rows.
+Relation categories use the private relation ID-to-name mapping. Select,
+multi-select, status, and mapped text categories use their exact user-visible
+value as the category name; that name must have an explicit archive target.
+Empty, malformed, unknown, or unmapped values must not be guessed or routed.
+The Category field routes the source row only and is not copied into archive
+rows.
 
 ## Optional Fields
 
@@ -103,7 +108,7 @@ Users may keep additional Notion fields, for example:
 - `date`
 - `deadline`
 - `priority`
-- `status`
+- a separate, non-routing `status`
 - `project`
 - `tags`
 - `estimate`

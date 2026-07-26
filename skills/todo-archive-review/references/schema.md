@@ -12,7 +12,7 @@ Every portable source to-do database must provide these properties:
 | --- | --- | --- | --- |
 | `Task` | title | yes | Source task title; copied to archive `Task`. |
 | `Done` | checkbox | yes | Completion gate. Unchecked rows are never organize candidates. |
-| `Category` | rich_text, relation, select, or mapped equivalent | yes | Routes the source row to archive category targets. |
+| `Category` | rich_text, relation, select, multi_select, status, or mapped equivalent | yes | Routes the source row to archive category targets. |
 | `Takeaway` | rich_text | yes | Learning/takeaway copied to archive rows. |
 | `Improvement` | rich_text | yes | Improvement note copied to archive rows. |
 
@@ -75,8 +75,13 @@ Categories are user configuration, not product constants.
 
 - Test/sandbox profiles map category names to target archive database IDs through `target_databases`.
 - Real profiles may map category names through both `project_categories` and `archive_tables`.
-- Relation/select/text values route target selection only. They are not copied into archive rows.
-- Unknown or unmapped categories should be skipped, reported, or routed through an explicit user approval path. Do not guess silently.
+- Relation values use the private relation ID-to-name mapping. Select,
+  multi-select, status, and mapped text values use their exact user-visible
+  names as category mapping keys.
+- Category values route target selection only. They are not copied into archive
+  rows.
+- Empty, malformed, unknown, or unmapped categories must fail closed or remain
+  explicitly unresolved. Do not guess silently.
 
 Example category names in templates are placeholders only.
 
@@ -109,7 +114,7 @@ Users may keep additional source fields such as:
 - `date`
 - `deadline`
 - `priority`
-- `status`
+- a separate, non-routing `status`
 - `project`
 - `tags`
 - `estimate`

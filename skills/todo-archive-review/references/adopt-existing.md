@@ -66,8 +66,10 @@ Optional fields such as date, deadline, priority, status, project, tags, estimat
 
 - Relation-based project/category fields map naturally to `project_categories` and `archive_tables` in a real profile.
 - Select or multi-select fields can map by option name.
+- Status fields map by their exact user-visible status name.
 - Rich text or title conventions can map by parsed label only if the rule is explicit and user-approved.
-- Empty, unknown, or ambiguous categories should be skipped or reported for manual mapping.
+- Empty, malformed, unknown, or unmapped categories must fail closed or be
+  reported as unresolved; never guess an archive target.
 - Personal example category names may appear in private config, but public examples should use neutral placeholder names.
 
 ## Approval Gates

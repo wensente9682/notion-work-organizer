@@ -143,7 +143,7 @@ def validate_config(config: dict[str, Any]) -> list[Finding]:
             findings.append(Finding("error", "config.number", f"{field} must be a positive integer."))
 
     if mode == "real":
-        for field in ("archive_tables_page_id", "archive_tables", "project_categories"):
+        for field in ("archive_tables_page_id", "archive_tables"):
             if field not in config:
                 findings.append(Finding("error", "config.missing", f"missing required real config field: {field}"))
         archive_tables = config.get("archive_tables")
@@ -221,6 +221,18 @@ def validate_schema(schema: dict[str, Any], config: dict[str, Any] | None = None
         findings.append(Finding("error", "schema.source", "schema must include source.properties."))
     else:
         findings.extend(validate_properties(source_properties, required_source_types(config), scope="source"))
+        fields = field_mapping(config)
+        category_type = property_type(source_properties.get(fields["category"]))
+        if (config or {}).get("mode") == "real" and category_type == "relation":
+            project_categories = (config or {}).get("project_categories")
+            if not isinstance(project_categories, dict) or not project_categories:
+                findings.append(
+                    Finding(
+                        "error",
+                        "config.mapping",
+                        "relation Category requires project_categories mapping.",
+                    )
+                )
 
     archives = archive_sections(schema)
     if not archives:

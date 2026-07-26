@@ -312,6 +312,17 @@ def _categories(prop: dict[str, Any], relation_names: Mapping[str, str]) -> tupl
         if not isinstance(selected, dict) or not isinstance(selected.get("name"), str):
             raise TotalViewError("category field has a malformed select payload")
         return (selected["name"],)
+    if prop_type == "status":
+        if "status" not in prop:
+            raise TotalViewError("category field has a malformed status payload")
+        selected = prop["status"]
+        if (
+            not isinstance(selected, dict)
+            or not isinstance(selected.get("name"), str)
+            or not selected["name"].strip()
+        ):
+            raise TotalViewError("category field has a malformed status payload")
+        return (selected["name"],)
     if prop_type == "relation":
         relations = prop.get("relation")
         if not isinstance(relations, list) or any(

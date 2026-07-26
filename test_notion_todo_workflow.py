@@ -33,6 +33,10 @@ def select(value):
     return {"type": "select", "select": {"name": value}}
 
 
+def status(value):
+    return {"type": "status", "status": None if value is None else {"name": value}}
+
+
 def url(value):
     return {"type": "url", "url": value}
 
@@ -102,6 +106,12 @@ def source_row(page_id, *, name, category="alpha", done=True, learnings="", impr
 def real_source_row(page_id, *, name, categories, done=True, learnings="", improvements=""):
     row = source_row(page_id, name=name, done=done, learnings=learnings, improvements=improvements)
     row["properties"]["category"] = relation(*categories)
+    return row
+
+
+def real_status_source_row(page_id, *, name, category, done=True, learnings="", improvements=""):
+    row = source_row(page_id, name=name, done=done, learnings=learnings, improvements=improvements)
+    row["properties"]["category"] = status(category)
     return row
 
 
@@ -240,6 +250,12 @@ def real_config():
             "admin": ADMIN_PROJECT_ID,
         },
     }
+
+
+def real_status_config():
+    cfg = real_config()
+    cfg.pop("project_categories")
+    return cfg
 
 
 def moved_record(target_id=TARGET_ID):
@@ -747,6 +763,145 @@ class PendingRemovalVisibilityTest(unittest.TestCase):
 class RealModePreviewTest(unittest.TestCase):
     def write_json(self, path, data):
         workflow.save_json(path, data)
+
+    def test_real_next_routes_status_category_by_visible_name(self):
+        eligible = real_status_source_row(
+            "eligible-status",
+            name="status-backed item",
+            category="research",
+            learnings="reusable note",
+        )
+
+        class StatusClient(FakeClient):
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                if database_id == SOURCE_DB:
+                    return {"results": [eligible], "has_more": False}
+                return {"results": [], "has_more": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "real_profile.json"
+            state_path = tmp_path / "state.json"
+            self.write_json(config_path, real_status_config())
+            self.write_json(state_path, {"batch": [], "moved": [], "skipped": []})
+            args = argparse.Namespace(config=config_path, state=state_path, batch_size=5, move_limit=None, force=False)
+
+            with (
+                patch.object(workflow, "preflight"),
+                patch.object(workflow, "get_client", return_value=StatusClient([])),
+                patch.object(workflow, "run_backup", return_value="session-1"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_next(args)
+
+            state = workflow.load_json(state_path, {})
+
+        self.assertEqual("research", state["batch"][0]["category"])
+        self.assertEqual(["research"], state["batch"][0]["category_options"])
+
+    def test_real_ok_routes_status_category_to_matching_archive_target(self):
+        source = real_status_source_row(
+            SOURCE_ID,
+            name="status-backed item",
+            category="research",
+            learnings="reusable note",
+        )
+        snapshot = workflow.real_candidate_from_notion_page(source, real_status_config())
+
+        class StatusWriteClient(FakeClient):
+            def __init__(self):
+                super().__init__([])
+                self.archive_tables_content = archive_tables_content()
+
+            def retrieve_page(self, page_id):
+                if workflow.notion_id(page_id) == SOURCE_ID:
+                    return source
+                return super().retrieve_page(page_id)
+
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                return {"results": [], "has_more": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "real_profile.json"
+            state_path = tmp_path / "state.json"
+            self.write_json(config_path, real_status_config())
+            self.write_json(
+                state_path,
+                {
+                    "batch": [snapshot.to_state()],
+                    "batch_id": 1,
+                    "moved": [],
+                    "skipped": [],
+                    "backup_session_id": "session-1",
+                    "session_id": "session-1",
+                },
+            )
+            client = StatusWriteClient()
+            args = argparse.Namespace(config=config_path, state=state_path, items=["1"], real_write_confirm=None)
+
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "run_backup", return_value="session-1"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_ok(args)
+
+        self.assertEqual(RESEARCH_ARCHIVE_DB, client.created_archive_rows[0][0])
+        self.assertEqual("research", client.created_archive_rows[0][1].category)
+
+    def test_real_next_fails_closed_for_empty_malformed_or_unmapped_status(self):
+        category_properties = [
+            status(None),
+            {"type": "status", "status": "private-category"},
+            status("private-category"),
+        ]
+        for category_property in category_properties:
+            with self.subTest(category=category_property):
+                row = real_status_source_row(
+                    "status-problem",
+                    name="private task",
+                    category="research",
+                    learnings="private note",
+                )
+                row["properties"]["category"] = category_property
+
+                class StatusClient(FakeClient):
+                    def query_database(self, database_id, start_cursor=None, page_size=100):
+                        if database_id == SOURCE_DB:
+                            return {"results": [row], "has_more": False}
+                        return {"results": [], "has_more": False}
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    config_path = tmp_path / "real_profile.json"
+                    state_path = tmp_path / "state.json"
+                    self.write_json(config_path, real_status_config())
+                    self.write_json(state_path, {"batch": [], "moved": [], "skipped": []})
+                    args = argparse.Namespace(
+                        config=config_path,
+                        state=state_path,
+                        batch_size=5,
+                        move_limit=None,
+                        force=False,
+                    )
+                    client = StatusClient([])
+
+                    with (
+                        patch.object(workflow, "preflight"),
+                        patch.object(workflow, "get_client", return_value=client),
+                        patch.object(workflow, "run_backup", return_value="session-1"),
+                        contextlib.redirect_stdout(io.StringIO()),
+                        self.assertRaises(workflow.WorkflowError) as raised,
+                    ):
+                        workflow.command_next(args)
+
+                    state = workflow.load_json(state_path, {})
+
+                self.assertEqual([], state["batch"])
+                self.assertEqual([], client.created_archive_rows)
+                self.assertNotIn("private-category", str(raised.exception))
+                self.assertNotIn("private task", str(raised.exception))
 
     def test_real_done_waits_for_confirm_source_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
