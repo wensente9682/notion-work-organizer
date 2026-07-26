@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
+import json
 from typing import Any, Mapping
 
 
@@ -30,10 +32,13 @@ ARCHIVE_ROLES = ("task", "takeaway", "improvement")
 class AdoptionRequest:
     source: str
     archive_targets: tuple[str, ...]
+    archive_container: str
     ordered_view: str
     source_fields: Mapping[str, str]
     total_fields: Mapping[str, str]
     category_routes: Mapping[str, str]
+    category_relations: Mapping[str, str]
+    profile: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,12 @@ class AdoptionReport:
     status: str
     checks: tuple[CompatibilityCheck, ...]
     next_action: str
+    _bindings_digest: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def render(self) -> str:
         lines = [f"Adoption compatibility: {self.status}"]
@@ -101,6 +112,48 @@ def _snapshot_problem(snapshot: Any) -> str | None:
     return None
 
 
+def _opaque_bindings_digest(profile: Any) -> str | None:
+    if not isinstance(profile, Mapping):
+        return None
+    try:
+        normalized = json.dumps(
+            dict(profile),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def _profile_matches_request(request: AdoptionRequest) -> bool:
+    profile = request.profile
+    if not isinstance(profile, Mapping):
+        return False
+    total = profile.get("total")
+    if not isinstance(total, Mapping):
+        return False
+    projects = profile.get("project_categories", {})
+    expected_projects = {
+        category: relation_id
+        for relation_id, category in request.category_relations.items()
+    }
+    return (
+        profile.get("mode") == "real"
+        and profile.get("source_database_id") == request.source
+        and profile.get("archive_tables_page_id") == request.archive_container
+        and profile.get("field_mapping") == request.source_fields
+        and profile.get("archive_tables") == request.category_routes
+        and set(request.archive_targets) == set(request.category_routes.values())
+        and total.get("view_id") == request.ordered_view
+        and total.get("fields") == request.total_fields
+        and total.get("category_relations", {}) == request.category_relations
+        and projects == expected_projects
+        and _opaque_bindings_digest(profile) is not None
+    )
+
+
 def _failed_report() -> AdoptionReport:
     codes = (
         "read.source",
@@ -131,6 +184,9 @@ def _failed_report() -> AdoptionReport:
 
 def inspect_existing_system(reader: Any, request: AdoptionRequest) -> AdoptionReport:
     """Inspect structural compatibility without writing or returning private values."""
+    if not _profile_matches_request(request):
+        return _failed_report()
+    bindings_digest = _opaque_bindings_digest(request.profile)
     try:
         source = reader.read_source_schema(request.source)
         if _snapshot_problem(source):
@@ -140,7 +196,11 @@ def inspect_existing_system(reader: Any, request: AdoptionRequest) -> AdoptionRe
             reader.read_archive_schema(reference)
             for reference in dict.fromkeys(request.archive_targets)
         ]
-        if any(_snapshot_problem(snapshot) for snapshot in archives):
+        if any(
+            _snapshot_problem(snapshot)
+            or snapshot.get("archive_container") != request.archive_container
+            for snapshot in archives
+        ):
             return _failed_report()
 
         view = reader.read_ordered_view(request.ordered_view)
@@ -256,7 +316,7 @@ def inspect_existing_system(reader: Any, request: AdoptionRequest) -> AdoptionRe
         )
 
     all_ready = all(check.status == READY for check in checks)
-    return AdoptionReport(
+    report = AdoptionReport(
         READY if all_ready else "not-ready",
         tuple(checks),
         (
@@ -265,3 +325,5 @@ def inspect_existing_system(reader: Any, request: AdoptionRequest) -> AdoptionRe
             else "resolve reported missing or incompatible requirements, then inspect again"
         ),
     )
+    object.__setattr__(report, "_bindings_digest", bindings_digest)
+    return report

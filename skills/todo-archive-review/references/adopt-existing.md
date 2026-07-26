@@ -42,6 +42,27 @@ Read `schema.md` before evaluating compatibility. If the user later switches to 
 8. Recommend read-only preview.
    A fully ready report may recommend separately approving generation or update of the ignored private profile. Inspection itself never writes that profile. Organize preview remains a later step after an approved profile exists; do not combine adoption with an archive write or source cleanup.
 
+## Approved Private Profile Step
+
+Only after the user accepts a current successful report, or explicitly accepts
+a partial report without incompatible findings:
+
+1. Use the Inspector-generated opaque bindings evidence with
+   `freeze_inspection_evidence(...)` to require an exact match with the
+   bindings the user confirmed. A ready status by itself is not sufficient
+   evidence for a different profile. Do not display or log the opaque digest.
+2. Use `propose_adoption_profile(...)` with that frozen evidence and the same
+   bindings to produce the sanitized proposal summary and its
+   proposal-specific approval phrase.
+3. Show that summary and ask for exact approval of this local profile write.
+   This approval does not authorize any Notion mutation.
+4. Only after the exact approval, call
+   `persist_approved_adoption_profile(...)`.
+
+Rejected or expired approval, stale inspection evidence, an ignore-boundary
+failure, an externally changed destination, or interrupted persistence must
+stop safely. Do not describe the profile as ready after any such failure.
+
 ## Field Compatibility
 
 Required source fields:

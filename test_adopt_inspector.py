@@ -21,7 +21,7 @@ TOTAL_FIELDS = {
 class FakeReader:
     def __init__(self, *, source=None, archives=None, view=None, error=None):
         self.source = source or ready_source()
-        self.archives = archives or {"archive-a": ready_archive()}
+        self.archives = archives or {"research": ready_archive()}
         self.view = view or ready_view()
         self.error = error
         self.calls = []
@@ -67,6 +67,7 @@ def ready_archive():
     return {
         "complete": True,
         "ambiguous": False,
+        "archive_container": "archive-container-reference",
         "properties": {
             "Work": {"type": "title"},
             "Learning": {"type": "rich_text"},
@@ -85,14 +86,32 @@ def ready_view():
     }
 
 
-def request():
+def inspected_profile():
+    return {
+        "mode": "real",
+        "source_database_id": "source-reference",
+        "archive_tables_page_id": "archive-container-reference",
+        "field_mapping": SOURCE_FIELDS,
+        "archive_tables": {"research": "research"},
+        "total": {
+            "view_id": "ordered-view-reference",
+            "fields": TOTAL_FIELDS,
+        },
+    }
+
+
+def request(profile=None):
+    profile = profile or inspected_profile()
     return AdoptionRequest(
-        source="source-private-id",
-        archive_targets=("archive-a",),
-        ordered_view="view-private-id",
-        source_fields=SOURCE_FIELDS,
-        total_fields=TOTAL_FIELDS,
-        category_routes={"research": "archive-a"},
+        source=profile["source_database_id"],
+        archive_targets=tuple(profile["archive_tables"].values()),
+        archive_container=profile["archive_tables_page_id"],
+        ordered_view=profile["total"]["view_id"],
+        source_fields=profile["field_mapping"],
+        total_fields=profile["total"]["fields"],
+        category_routes=profile["archive_tables"],
+        category_relations=profile["total"].get("category_relations", {}),
+        profile=profile,
     )
 
 
@@ -102,12 +121,15 @@ class AdoptInspectorTests(unittest.TestCase):
         report = inspect_existing_system(reader, request())
         self.assertEqual("ready", report.status)
         self.assertTrue(report.checks)
+        self.assertIsInstance(report._bindings_digest, str)
+        self.assertNotIn(report._bindings_digest, report.render())
+        self.assertNotIn(report._bindings_digest, repr(report))
         self.assertEqual({"ready"}, {check.status for check in report.checks})
         self.assertEqual(
             [
-                ("source", "source-private-id"),
-                ("archive", "archive-a"),
-                ("view", "view-private-id"),
+                ("source", "source-reference"),
+                ("archive", "research"),
+                ("view", "ordered-view-reference"),
             ],
             reader.calls,
         )
@@ -120,15 +142,12 @@ class AdoptInspectorTests(unittest.TestCase):
         source = ready_source()
         source["properties"].pop("Next time")
         source["category_values"] = ["research", "unmapped"]
-        reader = FakeReader(source=source, archives={})
-        adoption = request()
-        adoption = AdoptionRequest(**{**adoption.__dict__, "archive_targets": ()})
-        report = inspect_existing_system(reader, adoption)
+        report = inspect_existing_system(FakeReader(source=source), request())
         by_code = {check.code: check for check in report.checks}
         self.assertEqual("not-ready", report.status)
         self.assertEqual("missing", by_code["source.improvement"].status)
         self.assertEqual("missing", by_code["category.routing"].status)
-        self.assertEqual("missing", by_code["archive.payload"].status)
+        self.assertEqual("ready", by_code["archive.payload"].status)
 
     def test_incompatible_shapes_and_unverifiable_order_fail_closed(self):
         source = ready_source()
@@ -153,7 +172,9 @@ class AdoptInspectorTests(unittest.TestCase):
                 self.assertEqual("not-ready", report.status)
                 self.assertIn("incompatible", {check.status for check in report.checks})
                 for private in (
-                    "source-private-id",
+                    "source-reference",
+                    "archive-container-reference",
+                    "research",
                     "archive-a",
                     "view-private-id",
                     "research",
@@ -200,7 +221,7 @@ class AdoptInspectorTests(unittest.TestCase):
                     report = inspect_existing_system(
                         FakeReader(
                             source=source,
-                            archives={"archive-a": archive},
+                            archives={"research": archive},
                             view=view,
                         ),
                         request(),
@@ -221,8 +242,8 @@ class AdoptInspectorTests(unittest.TestCase):
         self.assertEqual({"incompatible"}, {check.status for check in report.checks})
         self.assertEqual(
             [
-                ("source", "source-private-id"),
-                ("archive", "archive-a"),
+                ("source", "source-reference"),
+                ("archive", "research"),
             ],
             reader.calls,
         )
