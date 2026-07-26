@@ -20,6 +20,7 @@ Choose exactly one route from the user's request:
 - **Monthly total**: use only when the user says `total YYYY-MM`. Validate the month before reading local config or calling Notion, then follow the read-only total route below.
 - **Organize existing workflow**: use when the user says `organize todo-test`, `organize todo`, `next`, `ok`, `dismiss`, `skip`, `undo`, `save`, `done`, `confirm`, `check`, `status`, or asks to review/archive existing Notion to-do records. Before acting, read `references/organize.md`.
 - **Adopt existing Notion list**: use when the user asks to configure, connect, adopt, migrate, inspect, or use an existing Notion to-do list with this system. Before acting, read `references/adopt-existing.md`.
+- **One-profile adoption readiness**: after an approved private adoption profile exists, use this only when the user asks to verify that profile for a specific `YYYY-MM`. Read `references/adopt-existing.md`; verify Total first, then enter Organize read-only preview with the same frozen profile. Do not carry approval from either step or start a write path.
 - **Setup new system**: use when the user asks to create, initialize, or set up a new Notion personal work/to-do system. Before acting, read `references/setup.md`.
 - **Schema/config/label help**: use when the user asks what fields/config are required, wants to rename Notion labels/properties, or asks how custom labels affect organize. Read `references/schema.md` if present; otherwise use the project-level `docs/schema.md`.
 

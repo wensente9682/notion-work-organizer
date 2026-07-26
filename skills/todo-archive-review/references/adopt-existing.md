@@ -2,7 +2,7 @@
 
 Use this route when the user wants to connect an existing Notion to-do list to this work maintenance system.
 
-First version policy: read-only. Inspect, compare, and report. Do not create or update a private profile, and do not create, update, migrate, archive, delete, or reshape Notion data during inspection.
+Inspection is read-only: inspect, compare, and report without local or Notion writes. A private profile may be created or updated only through the separate approved step below. Do not create, update, migrate, archive, delete, or reshape Notion data during inspection or readiness verification.
 
 ## Required References
 
@@ -62,6 +62,28 @@ a partial report without incompatible findings:
 Rejected or expired approval, stale inspection evidence, an ignore-boundary
 failure, an externally changed destination, or interrupted persistence must
 stop safely. Do not describe the profile as ready after any such failure.
+
+## One-Profile Readiness
+
+After the approved private profile has been saved, the normal Codex + Notion
+route may call `verify_one_profile_readiness(...)` for an explicit `YYYY-MM`.
+Use the Inspector evidence and the exact same ignored profile:
+if that evidence is not current in this session, run the read-only Inspector
+again instead of trusting the profile alone.
+
+1. Verify Total first against the configured ordered view and mappings.
+2. Only if Total succeeds, use the same frozen profile to enter an Organize
+   read-only preview that checks the source fields, Category routing, and
+   archive targets.
+3. Return only Total's category subtotals and overlapping grand total plus a
+   sanitized preview count. Never return item text, IDs, URLs, mappings,
+   credentials, or local paths.
+
+This readiness check grants no approval and creates no archive record, local
+batch, backup, cache, or cleanup state. If either step fails, if the profile or
+inspected bindings drift, or if a required read is incomplete, report only
+overall `not-ready`; do not return partial readiness. The external Python CLI
+remains an optional advanced fallback and is not required for this route.
 
 ## Field Compatibility
 
