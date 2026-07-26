@@ -2,7 +2,7 @@
 
 Use this route when the user wants to connect an existing Notion to-do list to this work maintenance system.
 
-First version policy: read-only by default. Inspect, compare, report, and draft config. Do not automatically create, update, migrate, archive, delete, or reshape Notion data.
+First version policy: read-only. Inspect, compare, and report. Do not create or update a private profile, and do not create, update, migrate, archive, delete, or reshape Notion data during inspection.
 
 ## Required References
 
@@ -33,14 +33,14 @@ Read `schema.md` before evaluating compatibility. If the user later switches to 
 5. Draft category mapping.
    Map each source category/project label or relation page to an archive target. Unknown or unmapped categories must be reported for user decision; do not guess silently.
 
-6. Draft local config.
-   Explain or draft a local profile such as `.todo_archive/real_profile.json`, based on `real_profile.example.json`. For sandbox testing, explain or draft a profile based on `config.example.json`. Do not commit profiles that contain real database IDs.
+6. Run the compatibility inspector.
+   With the Notion connector, collect only the bounded structural evidence needed by the public `inspect_existing_system(reader, request)` seam: source and archive schemas, observed Category routing coverage, and proof that the configured view is accessible, completely read, saved-order verifiable, and contains structured date anchors. Do not include raw Notion payloads or task text in the report.
 
 7. Report compatibility.
-   Summarize source readiness, category mapping readiness, archive target readiness, config readiness, and the safest next command.
+   Classify every source, routing, archive, ordered-view, and Total mapping requirement as `ready`, `missing`, or `incompatible`, with the bounded next action returned by the inspector. Ambiguous databases, inaccessible views, unsupported types, unverifiable ordering, and incomplete reads fail closed.
 
 8. Recommend read-only preview.
-   Before any write path, recommend previewing what would be organized and where it would route. Do not combine adoption with final source cleanup.
+   A fully ready report may recommend separately approving generation or update of the ignored private profile. Inspection itself never writes that profile. Organize preview remains a later step after an approved profile exists; do not combine adoption with an archive write or source cleanup.
 
 ## Field Compatibility
 
@@ -79,7 +79,7 @@ Ask for explicit approval before any of these actions:
 - Adding missing fields to an existing Notion database.
 - Creating archive tables or pages.
 - Editing relation targets, select options, formulas, filters, views, or existing rows.
-- Writing a local profile that contains real Notion database/page IDs.
+- Generating or updating an ignored local profile that contains real Notion bindings.
 - Running any real archive/write path.
 - Removing, archiving, or deleting completed source rows.
 
@@ -103,7 +103,7 @@ When reporting adoption results, use this compact structure:
 - Source database: ready / missing fields / needs mapping.
 - Category mapping: ready / partial / blocked.
 - Archive targets: ready / missing / needs approval.
-- Local config: draftable / drafted locally / blocked.
-- Next safest step: preview, add missing field with approval, create archive target with approval, or continue organize.
+- Ordered view and Total mappings: ready / missing / incompatible.
+- Next safest step: resolve one bounded finding or separately approve private profile generation.
 
 After adoption is complete and the user asks to organize, switch to `organize.md`. Preserve all existing organize behavior, including active batch continuation, `ok`, `dismiss`, `skip`, manual match, `undo`, `done`, and `confirm`.
