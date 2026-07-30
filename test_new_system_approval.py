@@ -4,10 +4,13 @@ import json
 import math
 import threading
 import unittest
+from collections.abc import Mapping
 
 from new_system_approval import (
     ApprovalEnvelope,
     ApprovalLedger,
+    AttemptClaim,
+    ActionPreview,
     GuidedAction,
     PreviewInputError,
     preview_next_action,
@@ -40,6 +43,95 @@ def expected_state():
 
 
 class NewSystemApprovalTests(unittest.TestCase):
+    def test_opaque_subclasses_are_rejected_before_protocol_calls(self):
+        calls = []
+
+        class EvilEnvelope(ApprovalEnvelope):
+            def __hash__(self):
+                calls.append("hash")
+                raise RuntimeError(CANARY_TASK)
+
+            def __eq__(self, _other):
+                calls.append("eq")
+                raise RuntimeError(CANARY_TASK)
+
+            def __repr__(self):
+                calls.append("repr")
+                raise RuntimeError(CANARY_TASK)
+
+        class EvilClaim(AttemptClaim):
+            def __hash__(self):
+                calls.append("claim-hash")
+                raise RuntimeError(CANARY_TASK)
+
+        class EvilPreview(ActionPreview):
+            def __hash__(self):
+                calls.append("preview-hash")
+                raise RuntimeError(CANARY_TASK)
+
+        ledger = ApprovalLedger()
+        envelope = EvilEnvelope()
+        preview = EvilPreview.__new__(EvilPreview)
+
+        self.assertIsNone(ledger.issue(preview, accepted=True))
+        self.assertEqual(ledger.claim_for_write(envelope).code, "approval.required")
+        self.assertEqual(
+            ledger.consume(envelope, action(), expected_state()).code,
+            "approval.required",
+        )
+        self.assertEqual(
+            ledger.finalize_write_attempt(
+                EvilClaim(), action(), expected_state()
+            ).code,
+            "approval.unknown",
+        )
+        self.assertEqual(calls, [])
+    def test_direct_canonicalization_exceptions_are_denied_and_consumed(self):
+        class ExplodingMapping(Mapping):
+            def __getitem__(self, _key):
+                raise RuntimeError(CANARY_TASK)
+
+            def __iter__(self):
+                raise RuntimeError(CANARY_TASK)
+
+            def __len__(self):
+                return 1
+
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(
+            ledger.preview(action(), expected_state()), accepted=True
+        )
+        direct = ledger.consume(envelope, ExplodingMapping(), expected_state())
+        retry = ledger.consume(envelope, action(), expected_state())
+
+        other = ApprovalLedger()
+        other_envelope = other.issue(
+            other.preview(action(), expected_state()), accepted=True
+        )
+        claim = other.claim_for_write(other_envelope)
+        finalized = other.finalize_write_attempt(
+            claim.claim, action(), ExplodingMapping()
+        )
+
+        self.assertEqual(direct.code, "approval.binding-mismatch")
+        self.assertEqual(retry.code, "approval.consumed")
+        self.assertEqual(finalized.code, "approval.binding-mismatch")
+        self.assertNotIn(CANARY_TASK, repr(direct) + repr(finalized))
+    def test_claim_blocks_direct_consume_until_finalize(self):
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(
+            ledger.preview(action(), expected_state()), accepted=True
+        )
+
+        claim = ledger.claim_for_write(envelope)
+        blocked = ledger.consume(envelope, action(), expected_state())
+        finalized = ledger.finalize_write_attempt(
+            claim.claim, action(), expected_state()
+        )
+
+        self.assertEqual(claim.code, "approval.claimed")
+        self.assertEqual(blocked.code, "approval.in-progress")
+        self.assertTrue(finalized.authorized)
     def test_public_summary_rejects_kind_and_key_canary_injection(self):
         kind_canary = "kind-db-secret-123"
         target_key_canary = "target-https://notion.so/secret-page"

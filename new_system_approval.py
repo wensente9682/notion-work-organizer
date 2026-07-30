@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import secrets
 import threading
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -205,6 +206,32 @@ class ApprovalEnvelope:
         return "ApprovalEnvelope(status='approval-issued')"
 
 
+class AttemptClaim:
+    """Opaque, in-memory ownership of one T4 write attempt."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "AttemptClaim()"
+
+
+@dataclass(frozen=True)
+class _ClaimDecision:
+    code: str
+    claim: AttemptClaim | None
+    action_digest: str | None
+    attempt_fingerprint: str | None
+
+
+@dataclass
+class _ApprovalRecord:
+    binding_digest: str
+    action_digest: str
+    state: str = "pending"
+    claim: AttemptClaim | None = None
+    attempt_fingerprint: str | None = None
+
+
 @dataclass(frozen=True)
 class AuthorizationDecision:
     status: str
@@ -218,7 +245,8 @@ class AuthorizationDecision:
 class ApprovalLedger:
     def __init__(self) -> None:
         self._previews: dict[ActionPreview, tuple[str, str, str, bytes, bool]] = {}
-        self._approvals: dict[ApprovalEnvelope, tuple[str, bool]] = {}
+        self._approvals: dict[ApprovalEnvelope, _ApprovalRecord] = {}
+        self._claims: dict[AttemptClaim, ApprovalEnvelope] = {}
         self._lock = threading.Lock()
 
     def preview(self, action: object, expected_state: object) -> ActionPreview:
@@ -235,7 +263,7 @@ class ApprovalLedger:
         return preview
 
     def issue(self, preview: object, *, accepted: bool) -> ApprovalEnvelope | None:
-        if not isinstance(preview, ActionPreview):
+        if type(preview) is not ActionPreview:
             return None
         with self._lock:
             record = self._previews.get(preview)
@@ -253,8 +281,86 @@ class ApprovalLedger:
             if accepted is not True:
                 return None
             envelope = ApprovalEnvelope()
-            self._approvals[envelope] = (record[0], False)
+            self._approvals[envelope] = _ApprovalRecord(record[0], record[1])
             return envelope
+
+    def claim_for_write(self, envelope: object) -> _ClaimDecision:
+        if type(envelope) is not ApprovalEnvelope:
+            return _ClaimDecision("approval.required", None, None, None)
+        with self._lock:
+            record = self._approvals.get(envelope)
+            if record is None:
+                return _ClaimDecision("approval.unknown", None, None, None)
+            if record.state == "consumed":
+                return _ClaimDecision(
+                    "approval.consumed",
+                    None,
+                    record.action_digest,
+                    record.attempt_fingerprint,
+                )
+            if record.state == "in-progress":
+                return _ClaimDecision(
+                    "approval.in-progress",
+                    None,
+                    record.action_digest,
+                    record.attempt_fingerprint,
+                )
+            claim = AttemptClaim()
+            record.state = "in-progress"
+            record.claim = claim
+            record.attempt_fingerprint = secrets.token_hex(16)
+            self._claims[claim] = envelope
+            return _ClaimDecision(
+                "approval.claimed",
+                claim,
+                record.action_digest,
+                record.attempt_fingerprint,
+            )
+
+    def _evaluate_consumed(
+        self,
+        record: _ApprovalRecord,
+        action: object,
+        expected_state: object,
+        *,
+        interrupted: bool,
+    ) -> AuthorizationDecision:
+        if interrupted:
+            return AuthorizationDecision("denied", "approval.interrupted", False)
+        try:
+            attempted = preview_next_action(action, expected_state).binding_digest
+        except Exception:
+            attempted = None
+        if attempted != record.binding_digest:
+            return AuthorizationDecision("denied", "approval.binding-mismatch", False)
+        return AuthorizationDecision("authorized", "approval.authorized", True)
+
+    def finalize_write_attempt(
+        self,
+        claim: object,
+        action: object,
+        expected_state: object,
+        *,
+        interrupted: bool = False,
+    ) -> AuthorizationDecision:
+        if type(claim) is not AttemptClaim:
+            return AuthorizationDecision("denied", "approval.unknown", False)
+        with self._lock:
+            envelope = self._claims.get(claim)
+            record = self._approvals.get(envelope) if envelope else None
+            if record is None:
+                return AuthorizationDecision("denied", "approval.unknown", False)
+            if record.state == "consumed":
+                return AuthorizationDecision("denied", "approval.consumed", False)
+            if record.state != "in-progress" or record.claim is not claim:
+                return AuthorizationDecision("denied", "approval.in-progress", False)
+            record.state = "consumed"
+        return self._evaluate_consumed(
+            record,
+            action,
+            expected_state,
+            interrupted=interrupted,
+        )
 
     def consume(
         self,
@@ -264,25 +370,23 @@ class ApprovalLedger:
         *,
         interrupted: bool = False,
     ) -> AuthorizationDecision:
-        if not isinstance(envelope, ApprovalEnvelope):
+        if type(envelope) is not ApprovalEnvelope:
             return AuthorizationDecision("denied", "approval.required", False)
         with self._lock:
             record = self._approvals.get(envelope)
             if record is None:
                 return AuthorizationDecision("denied", "approval.unknown", False)
-            binding_digest, consumed = record
-            if consumed:
+            if record.state == "consumed":
                 return AuthorizationDecision("denied", "approval.consumed", False)
-            self._approvals[envelope] = (binding_digest, True)
-        if interrupted:
-            return AuthorizationDecision("denied", "approval.interrupted", False)
-        try:
-            attempted = preview_next_action(action, expected_state).binding_digest
-        except (PreviewInputError, TypeError, ValueError):
-            attempted = None
-        if attempted != binding_digest:
-            return AuthorizationDecision("denied", "approval.binding-mismatch", False)
-        return AuthorizationDecision("authorized", "approval.authorized", True)
+            if record.state == "in-progress":
+                return AuthorizationDecision("denied", "approval.in-progress", False)
+            record.state = "consumed"
+        return self._evaluate_consumed(
+            record,
+            action,
+            expected_state,
+            interrupted=interrupted,
+        )
 
     def __repr__(self) -> str:
         return "ApprovalLedger()"
