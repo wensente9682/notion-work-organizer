@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Mapping
 
-from new_system_approval import ApprovalLedger, PreviewInputError, preview_next_action
+from new_system_approval import (
+    ApprovalLedger,
+    PreviewInputError,
+    canonical_action_bytes,
+    canonical_expected_state_bytes,
+    preview_next_action,
+)
 from new_system_recovery_journal import RecoveryJournal
 
 
@@ -180,6 +187,8 @@ class WriteCoordinator:
         claim = claimed.claim
         action_digest = claimed.action_digest
         fingerprint = claimed.attempt_fingerprint
+        action_canonical = claimed.action_canonical
+        expected_state_canonical = claimed.expected_state_canonical
         phase = "claim"
         read_attempted = False
         write_attempted = False
@@ -211,6 +220,17 @@ class WriteCoordinator:
             )
 
         try:
+            if (
+                type(action_canonical) is not bytes
+                or type(expected_state_canonical) is not bytes
+                or not self._matches_claimed_snapshot(
+                    action,
+                    expected_state,
+                    action_canonical,
+                    expected_state_canonical,
+                )
+            ):
+                return recovery("approval-required", interrupted=True)
             if interrupt_before_read:
                 return recovery(
                     "interrupted",
@@ -219,9 +239,16 @@ class WriteCoordinator:
             phase = "read"
             read_attempted = True
             try:
-                observed = adapter.read_exact(action)
+                observed = adapter.read_exact(self._decode_snapshot(action_canonical))
             except Exception:
                 return recovery("read-unavailable")
+            if not self._matches_claimed_snapshot(
+                action,
+                expected_state,
+                action_canonical,
+                expected_state_canonical,
+            ):
+                return recovery("authority-drift", interrupted=True)
             if isinstance(observed, ReadFailure):
                 if type(observed.reason) is str:
                     if observed.reason == "inaccessible":
@@ -236,7 +263,7 @@ class WriteCoordinator:
             if not isinstance(observed, Mapping) or not observed:
                 return recovery("read-malformed")
             try:
-                preview_next_action(action, observed)
+                preview_next_action(self._decode_snapshot(action_canonical), observed)
             except Exception:
                 return recovery("read-malformed")
             if interrupt_after_read:
@@ -245,7 +272,9 @@ class WriteCoordinator:
                     interrupted=True,
                 )
             phase = "authorize"
-            decision = self._ledger.finalize_write_attempt(claim, action, observed)
+            decision = self._ledger.finalize_write_attempt(
+                claim, self._decode_snapshot(action_canonical), observed
+            )
             if not decision.authorized:
                 return self._recovery(
                     "drift" if decision.code == "approval.binding-mismatch" else "approval-denied",
@@ -260,7 +289,14 @@ class WriteCoordinator:
             phase = "write"
             write_attempted = True
             try:
-                outcome = adapter.write_once(action)
+                if not self._matches_claimed_snapshot(
+                    action,
+                    expected_state,
+                    action_canonical,
+                    expected_state_canonical,
+                ):
+                    return recovery("authority-drift", interrupted=True)
+                outcome = adapter.write_once(self._decode_snapshot(action_canonical))
             except Exception:
                 outcome = None
             if type(outcome) is not str:
@@ -317,6 +353,26 @@ class WriteCoordinator:
         except Exception:
             return recovery("internal-failure", interrupted=True)
 
+    @staticmethod
+    def _decode_snapshot(canonical: bytes) -> object:
+        return json.loads(canonical)
+
+    @staticmethod
+    def _matches_claimed_snapshot(
+        action: object,
+        expected_state: object,
+        action_canonical: bytes,
+        expected_state_canonical: bytes,
+    ) -> bool:
+        try:
+            return (
+                canonical_action_bytes(action) == action_canonical
+                and canonical_expected_state_bytes(expected_state)
+                == expected_state_canonical
+            )
+        except Exception:
+            return False
+
     def _run_journal(
         self, envelope: object, action: object, expected_state: object, adapter: object,
         journal: object, *, interrupt_before_read: bool, interrupt_after_read: bool,
@@ -328,20 +384,35 @@ class WriteCoordinator:
         if type(journal) is not RecoveryJournal:
             return result("journal-required")
         try:
+            from new_system_connector_action_adapter import CanonicalConnectorActionAdapter
+        except Exception:
+            return result("adapter-required")
+        if type(adapter) is not CanonicalConnectorActionAdapter:
+            return result("adapter-required")
+        try:
             existing = journal.resume_review().to_public_dict()
         except Exception:
             return result("journal-unavailable")
         if type(existing) is not dict or existing.get("status") != "fresh-review-required" or existing.get("phase") is not None or existing.get("failure_class") != "none":
             return result("journal-review-required")
-        try:
-            supplied_digest = preview_next_action(action, expected_state).action_digest
-        except Exception:
-            return result("approval-required")
         claimed = self._ledger.claim_for_write(envelope)
         if claimed.claim is None:
             return result("approval-required", claimed.code == "approval.consumed")
         claim, digest, fingerprint = claimed.claim, claimed.action_digest, claimed.attempt_fingerprint
-        if type(digest) is not str or type(fingerprint) is not str or supplied_digest != digest:
+        action_canonical = claimed.action_canonical
+        expected_state_canonical = claimed.expected_state_canonical
+        if (
+            type(digest) is not str
+            or type(fingerprint) is not str
+            or type(action_canonical) is not bytes
+            or type(expected_state_canonical) is not bytes
+            or not self._matches_claimed_snapshot(
+                action,
+                expected_state,
+                action_canonical,
+                expected_state_canonical,
+            )
+        ):
             self._ledger.finalize_write_attempt(claim, action, expected_state, interrupted=True)
             return result("approval-required", True)
         def fact(phase: str) -> dict[str, object]:
@@ -370,33 +441,56 @@ class WriteCoordinator:
             return result(reason, True, read, write, phase, certainty)
         if not advance("prepared"):
             return stop("journal-failed")
+        if not self._matches_claimed_snapshot(action, expected_state, action_canonical, expected_state_canonical):
+            return stop("authority-drift")
         if interrupt_before_read:
             return stop("interrupted", phase="claim")
         try:
-            observed = adapter.read_exact(action)
+            observed = adapter.read_exact(self._decode_snapshot(action_canonical))
         except Exception:
             return stop("read-unavailable", read=True, phase="read")
+        if not self._matches_claimed_snapshot(action, expected_state, action_canonical, expected_state_canonical):
+            return stop("authority-drift", read=True, phase="read")
         if isinstance(observed, ReadFailure) or not isinstance(observed, Mapping) or not observed:
             return stop("read-unavailable", read=True, phase="read")
         try:
-            preview_next_action(action, observed)
+            preview_next_action(self._decode_snapshot(action_canonical), observed)
         except Exception:
             return stop("read-unavailable", read=True, phase="read")
         if not advance("read-completed"):
             return stop("journal-failed", read=True, phase="read")
+        if not self._matches_claimed_snapshot(action, expected_state, action_canonical, expected_state_canonical):
+            return stop("authority-drift", read=True, phase="read")
         if interrupt_after_read:
             return stop("interrupted", read=True, phase="read")
-        if observed != expected_state:
+        approved_expected_state = self._decode_snapshot(expected_state_canonical)
+        if observed != approved_expected_state:
             return stop("drift", read=True, phase="authorize")
-        decision = self._ledger.finalize_write_attempt(claim, action, observed)
+        decision = self._ledger.finalize_write_attempt(
+            claim, self._decode_snapshot(action_canonical), observed
+        )
         if not decision.authorized:
             return stop("drift", read=True, phase="authorize", interrupted=False)
-        if not advance("write-started"):
+        if not advance("write-ready"):
             return result("journal-failed", True, True, False, "write")
+        if not self._matches_claimed_snapshot(action, expected_state, action_canonical, expected_state_canonical):
+            return stop("authority-drift", read=True, phase="authorize")
         try:
-            outcome = adapter.write_once(action)
+            evidence = CanonicalConnectorActionAdapter._write_once_evidenced(
+                adapter, self._decode_snapshot(action_canonical)
+            )
         except Exception:
-            outcome = "unknown"
+            evidence = None
+        try:
+            from new_system_connector_action_adapter import _AdapterWrite
+            attempted = type(evidence) is _AdapterWrite and evidence._attempted is True
+            outcome = evidence._outcome if type(evidence) is _AdapterWrite else "unknown"
+        except Exception:
+            attempted, outcome = False, "unknown"
+        if not attempted:
+            return stop("write-not-attempted", read=True, phase="authorize")
+        if not advance("write-started"):
+            return result("journal-failed", True, True, True, "write", "unknown")
         if type(outcome) is not str:
             outcome = "unknown"
         terminal = {"success": ("confirmed-applied", "completed", "confirmed"),

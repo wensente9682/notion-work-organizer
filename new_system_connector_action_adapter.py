@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 from collections.abc import Mapping
 from types import FunctionType, MappingProxyType
 
 from new_system_write_coordinator import ReadFailure
+from new_system_approval import PreviewInputError, canonical_action_bytes
 
 
 _MAX_DEPTH = 4
@@ -23,7 +23,7 @@ _SCHEMAS = {
     "configure_property": ({"database", "property"}, {"type"}),
     "configure_view_sort": ({"database", "view"}, {"sort"}),
     "create_archive_container": ({"parent"}, {"title"}),
-    "create_archive_target": ({"container", "category"}, {"schema"}),
+    "create_archive_target": ({"container", "category"}, {"display_name", "schema"}),
 }
 
 
@@ -89,6 +89,24 @@ class _AdapterRead(Mapping):
 
     def __repr__(self) -> str:
         return "AdapterRead(status='read-completed')"
+
+
+class _AdapterWrite:
+    __slots__ = ("_attempted", "_outcome")
+
+    def __init__(self, attempted: bool, outcome: str):
+        self._attempted = attempted
+        self._outcome = outcome
+
+    def to_public_dict(self) -> dict[str, object]:
+        return {
+            "status": "write-result",
+            "connector_write_attempted": self._attempted,
+            "outcome": self._outcome,
+        }
+
+    def __repr__(self) -> str:
+        return "AdapterWrite(status='closed')"
 
 
 def _plain(
@@ -163,15 +181,32 @@ def _action(action: object):
     if kind in {"create_database", "create_archive_target"}:
         if type(payload["schema"]) is not dict or not payload["schema"]:
             return None
+        if kind == "create_archive_target" and (
+            type(payload["display_name"]) is not str
+            or not payload["display_name"].strip()
+        ):
+            return None
     elif any(type(item) is not str or not item.strip() for item in payload.values()):
         return None
     try:
-        canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    except (TypeError, ValueError, OverflowError):
+        canonical = canonical_action_bytes(value)
+    except (PreviewInputError, TypeError, ValueError, OverflowError):
         return None
     if len(canonical) > _MAX_CANONICAL_BYTES:
         return None
     return hashlib.sha256(canonical).hexdigest(), value
+
+
+def _connector_request(action: dict[str, object]) -> dict[str, object]:
+    if action["kind"] != "create_archive_target":
+        return action
+    target = action["target"]
+    payload = action["payload"]
+    return {
+        "parent": {"page_id": target["container"]},
+        "title": payload["display_name"],
+        "schema": payload["schema"],
+    }
 
 
 def _connector_method(connector: object, name: str) -> FunctionType | None:
@@ -214,7 +249,8 @@ class CanonicalConnectorActionAdapter:
                 if (self._read_claimed and not self._write_used) or self._write_inflight:
                     self._authority_revoked = True
                 return _AdapterFailure("invalid-action")
-            digest, request = checked
+            digest, action_value = checked
+            request = _connector_request(action_value)
             if self._read_claimed:
                 self._authority_revoked = True
                 return _AdapterFailure("read-terminal")
@@ -244,27 +280,31 @@ class CanonicalConnectorActionAdapter:
         return _AdapterRead(plain)
 
     def write_once(self, action: object):
+        return self._write_once_evidenced(action)._outcome
+
+    def _write_once_evidenced(self, action: object) -> _AdapterWrite:
         with self._lock:
             checked = _action(action)
             if checked is None:
                 if (self._read_claimed and not self._write_used) or self._write_inflight:
                     self._authority_revoked = True
-                return "unknown"
-            digest, request = checked
+                return _AdapterWrite(False, "unknown")
+            digest, action_value = checked
+            request = _connector_request(action_value)
             if self._write_inflight:
                 self._authority_revoked = True
-                return "unknown"
+                return _AdapterWrite(False, "unknown")
             if self._write_used or self._authority_revoked or self._read_digest != digest or self._read_data is None:
                 if self._read_claimed and not self._write_used:
                     self._authority_revoked = True
-                return "unknown"
+                return _AdapterWrite(False, "unknown")
             self._write_used = True
             self._write_inflight = True
         method = _connector_method(self._connector, "write_canonical")
         if method is None:
             with self._lock:
                 self._write_inflight = False
-            return "unknown"
+            return _AdapterWrite(False, "unknown")
         try:
             outcome = method(self._connector, request)
         except BaseException:
@@ -272,5 +312,6 @@ class CanonicalConnectorActionAdapter:
         with self._lock:
             self._write_inflight = False
             if self._authority_revoked:
-                return "unknown"
-        return outcome if type(outcome) is str and outcome in {"success", "changed", "no-op", "partial", "ambiguous"} else "unknown"
+                return _AdapterWrite(True, "unknown")
+        closed = outcome if type(outcome) is str and outcome in {"success", "changed", "no-op", "partial", "ambiguous"} else "unknown"
+        return _AdapterWrite(True, closed)

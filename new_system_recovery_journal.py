@@ -12,11 +12,12 @@ from pathlib import Path
 _LOCK_FSYNC = os.fsync
 
 
-_PHASES = {"prepared", "read-completed", "write-started", "confirmed-applied",
+_PHASES = {"prepared", "read-completed", "write-ready", "write-started", "confirmed-applied",
            "confirmed-not-applied", "outcome-unknown", "possible-partial", "interrupted", "consumed"}
 _NEXT = {
     None: {"prepared"}, "prepared": {"read-completed", "interrupted"},
-    "read-completed": {"write-started", "interrupted"},
+    "read-completed": {"write-ready", "interrupted"},
+    "write-ready": {"write-started", "interrupted"},
     "write-started": {"confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial", "interrupted"},
     "confirmed-applied": {"consumed"}, "confirmed-not-applied": {"consumed"},
 }
@@ -284,7 +285,10 @@ class RecoveryJournal:
             if self._revoked: return self._result("rejected", failure="state-invalid")
             if getattr(self._active, "dirty", False) or self._has_sentinel(): return self._result("fresh-review-required")
             if data is None: return self._result("fresh-review-required")
-            classification = "possible-partial" if data["phase"] in {"write-started", "interrupted"} else "fresh-reinspection"
+            classification = "possible-partial" if (
+                data["phase"] in {"write-ready", "write-started"}
+                or data["write_attempted"]
+            ) else "fresh-reinspection"
             if data["phase"] in {"confirmed-applied", "confirmed-not-applied", "consumed"} and not data["review_generated"]:
                 data = dict(data); data["review_generated"] = True; self._lifecycle(fd, lambda: self._write(data))
             if getattr(self._active, "poison", False): return self._result("rejected", data["phase"])
@@ -324,11 +328,11 @@ def _facts(event, facts, previous):
     keys = {"action_digest", "attempt_fingerprint", "read_attempted", "write_attempted", "write_started"}
     if any(type(key) is not str for key in facts) or set(facts) != keys or not _hex(facts.get("action_digest"), 64) or not _hex(facts.get("attempt_fingerprint"), 32): return None
     if any(type(facts[k]) is not bool for k in keys - {"action_digest", "attempt_fingerprint"}): return None
-    expected = {"read_attempted": event in {"read-completed", "write-started", "confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial", "consumed"},
+    expected = {"read_attempted": event in {"read-completed", "write-ready", "write-started", "confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial", "consumed"},
                 "write_attempted": event in {"write-started", "confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial", "consumed"},
                 "write_started": event in {"write-started", "confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial", "consumed"}}
     if event == "interrupted":
-        expected = {"read_attempted": previous in {"read-completed", "write-started"}, "write_attempted": previous == "write-started", "write_started": previous == "write-started"}
+        expected = {"read_attempted": previous in {"read-completed", "write-ready", "write-started"}, "write_attempted": previous == "write-started", "write_started": previous == "write-started"}
     if any(facts[k] != expected[k] for k in expected): return None
     return dict(facts)
 

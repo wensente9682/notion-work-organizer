@@ -44,6 +44,17 @@ def alternate_action():
     }
 
 
+def archive_action(display_name="Synthetic Archive"):
+    return {
+        "kind": "create_archive_target",
+        "target": {"container": "synthetic-container", "category": "slot-1"},
+        "payload": {
+            "display_name": display_name,
+            "schema": {"Task": "title"},
+        },
+    }
+
+
 class DynamicTrap:
     def __init__(self, calls):
         self.calls = calls
@@ -93,6 +104,36 @@ def approved(ledger, current_action=None, expected=None):
 
 
 class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
+    def test_archive_display_name_is_required_and_maps_to_create_database_title(self):
+        class CapturingConnector(SyntheticConnector):
+            def read_canonical(self, request):
+                self.read_request = request
+                return super().read_canonical(request)
+
+            def write_canonical(self, request):
+                self.write_request = request
+                return super().write_canonical(request)
+
+        connector = CapturingConnector()
+        subject = adapter(connector)
+        self.assertNotIsInstance(subject.read_exact(archive_action()), ReadFailure)
+        self.assertEqual(
+            {
+                "parent": {"page_id": "synthetic-container"},
+                "title": "Synthetic Archive",
+                "schema": {"Task": "title"},
+            },
+            connector.read_request,
+        )
+        self.assertEqual("success", subject.write_once(archive_action()))
+        self.assertEqual(connector.read_request, connector.write_request)
+
+        connector = SyntheticConnector()
+        missing = archive_action()
+        del missing["payload"]["display_name"]
+        self.assertIsInstance(adapter(connector).read_exact(missing), ReadFailure)
+        self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+
     def test_closed_allowlist_rejects_unknown_action_without_connector_call(self):
         connector = SyntheticConnector()
         result = adapter(connector).read_exact(action("existing-list.archive"))
@@ -106,7 +147,7 @@ class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
             ("configure_property", {"database": "synthetic", "property": "Category"}, {"type": "select"}),
             ("configure_view_sort", {"database": "synthetic", "view": "ordered"}, {"sort": "Work Date DESC"}),
             ("create_archive_container", {"parent": "synthetic-parent"}, {"title": "archive"}),
-            ("create_archive_target", {"container": "synthetic-container", "category": "slot-1"}, {"schema": {"title": "synthetic"}}),
+            ("create_archive_target", {"container": "synthetic-container", "category": "slot-1"}, {"display_name": "Synthetic Archive", "schema": {"title": "synthetic"}}),
         )
         for kind, target, payload in cases:
             with self.subTest(family=kind):
@@ -132,6 +173,55 @@ class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
                 self.assertIsInstance(result, ReadFailure)
                 self.assertEqual(0, connector.read_calls)
                 self.assertEqual([], calls)
+
+    def test_archive_display_name_rejects_malformed_dynamic_and_utf8_over_limit_values(self):
+        class TextSubclass(str):
+            pass
+
+        cases = (
+            "",
+            "   ",
+            TextSubclass("Synthetic Archive"),
+            DynamicTrap([]),
+            None,
+            1,
+            "a" * 129,
+            "界" * 43,
+        )
+        for display_name in cases:
+            with self.subTest(value_type=type(display_name).__name__):
+                connector = SyntheticConnector()
+                result = adapter(connector).read_exact(archive_action(display_name))
+                self.assertIsInstance(result, ReadFailure)
+                self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+
+        connector = SyntheticConnector()
+        self.assertNotIsInstance(
+            adapter(connector).read_exact(archive_action("a" * 128)),
+            ReadFailure,
+        )
+        self.assertEqual(1, connector.read_calls)
+
+    def test_archive_display_name_tamper_revokes_write_and_public_evidence_is_sanitized(self):
+        private_title = "private-synthetic-archive-title"
+        connector = SyntheticConnector()
+        subject = adapter(connector)
+        self.assertNotIsInstance(
+            subject.read_exact(archive_action(private_title)), ReadFailure
+        )
+        outcome = subject.write_once(archive_action(private_title + "-changed"))
+        retry = subject.write_once(archive_action(private_title))
+        public = json.dumps(
+            {
+                "outcome": outcome,
+                "retry": retry,
+            },
+            sort_keys=True,
+        )
+        self.assertNotEqual("success", outcome)
+        self.assertNotEqual("success", retry)
+        self.assertEqual((1, 0), (connector.read_calls, connector.write_calls))
+        self.assertNotIn(private_title, public)
 
     def test_missing_forged_and_reused_approval_have_correct_lifecycle_facts(self):
         connector = SyntheticConnector()

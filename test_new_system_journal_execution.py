@@ -31,6 +31,17 @@ def action(kind="create_database"):
     return {"kind": kind, "target": {"parent": CANARY_ID}, "payload": {"schema": {"title": "synthetic"}}}
 
 
+def archive_action(display_name="Synthetic Archive"):
+    return {
+        "kind": "create_archive_target",
+        "target": {"container": CANARY_ID, "category": "slot-1"},
+        "payload": {
+            "display_name": display_name,
+            "schema": {"Task": "title"},
+        },
+    }
+
+
 def state(value="absent"):
     return {"target": {"parent": CANARY_ID}, "state": value}
 
@@ -93,15 +104,257 @@ class T9RedGate(unittest.TestCase):
             return original(instance, phase, supplied)
         with mock.patch.object(RecoveryJournal, "transition", new=transition), mock.patch.object(ApprovalLedger, "claim_for_write", new=claim):
             result = self.execute(WriteCoordinator(ledger), envelope, adapter, journal)
-        self.assertEqual(["prepared", "read-completed", "write-started", "confirmed-applied"], [phase for phase, _ in captured])
-        self.assertEqual(["journal:prepared", "read", "journal:read-completed", "journal:write-started", "write", "journal:confirmed-applied"], events)
+        self.assertEqual(["prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"], [phase for phase, _ in captured])
+        self.assertEqual(["journal:prepared", "read", "journal:read-completed", "journal:write-ready", "write", "journal:write-started", "journal:confirmed-applied"], events)
         self.assertEqual(1, len(claimed)); self.assertTrue(all(value["action_digest"] == claimed[0].action_digest and value["attempt_fingerprint"] == claimed[0].attempt_fingerprint for _, value in captured))
-        expected_facts = {"prepared": (False, False, False), "read-completed": (True, False, False), "write-started": (True, True, True), "confirmed-applied": (True, True, True)}
+        expected_facts = {"prepared": (False, False, False), "read-completed": (True, False, False), "write-ready": (True, False, False), "write-started": (True, True, True), "confirmed-applied": (True, True, True)}
         self.assertEqual(expected_facts, {phase: (value["read_attempted"], value["write_attempted"], value["write_started"]) for phase, value in captured})
         self.assertTrue(result.authorized)
 
+    def test_archive_title_binding_is_identical_across_preview_journal_and_adapter_request(self):
+        class CapturingConnector(Connector):
+            def read_canonical(self, request):
+                self.read_request = request
+                return super().read_canonical(request)
+
+            def write_canonical(self, request):
+                self.write_request = request
+                return super().write_canonical(request)
+
+        current = archive_action("研究 é")
+        ledger = ApprovalLedger()
+        preview = ledger.preview(current, state())
+        envelope = ledger.issue(preview, accepted=True)
+        connector = CapturingConnector()
+        journal = RecoveryJournal(self.root)
+        captured = []
+        original = RecoveryJournal.transition
+
+        def transition(instance, phase, supplied):
+            if instance is journal:
+                captured.append((phase, dict(supplied)))
+            return original(instance, phase, supplied)
+
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = WriteCoordinator(ledger).run(
+                envelope,
+                current,
+                state(),
+                CanonicalConnectorActionAdapter(connector),
+                recovery_journal=journal,
+            )
+
+        expected_request = {
+            "parent": {"page_id": CANARY_ID},
+            "title": "研究 é",
+            "schema": {"Task": "title"},
+        }
+        self.assertEqual("completed", result.status)
+        self.assertEqual(expected_request, connector.read_request)
+        self.assertEqual(expected_request, connector.write_request)
+        self.assertTrue(captured)
+        self.assertTrue(
+            all(item["action_digest"] == preview.action_digest for _, item in captured)
+        )
+
+    def test_archive_title_change_after_approval_fails_before_journal_or_connector_io(self):
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(
+            ledger.preview(archive_action("Archive A"), state()), accepted=True
+        )
+        connector = Connector()
+        journal = RecoveryJournal(self.root)
+        transitions = []
+        original = RecoveryJournal.transition
+
+        def transition(instance, phase, supplied):
+            if instance is journal:
+                transitions.append(phase)
+            return original(instance, phase, supplied)
+
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = WriteCoordinator(ledger).run(
+                envelope,
+                archive_action("Archive B"),
+                state(),
+                CanonicalConnectorActionAdapter(connector),
+                recovery_journal=journal,
+            )
+
+        self.assertFalse(result.authorized)
+        self.assertEqual([], transitions)
+        self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+
+    def assert_archive_drift_facts(self, mutation_phase, *, connector_class=Connector):
+        current = archive_action("Archive A")
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(ledger.preview(current, state()), accepted=True)
+        connector = connector_class()
+        root = self.root / mutation_phase
+        journal = RecoveryJournal(root)
+        original = RecoveryJournal.transition
+
+        def transition(instance, phase, supplied):
+            result = original(instance, phase, supplied)
+            if instance is journal and phase == mutation_phase:
+                current["payload"]["display_name"] = "Archive B"
+            return result
+
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = WriteCoordinator(ledger).run(
+                envelope,
+                current,
+                state(),
+                CanonicalConnectorActionAdapter(connector),
+                recovery_journal=journal,
+            )
+
+        self.assertNotEqual("completed", result.status)
+        self.assertFalse(result.authorized)
+        self.assertNotIn("Archive A", json.dumps(result.to_public_dict(), sort_keys=True))
+        self.assertNotIn("Archive B", json.dumps(result.to_public_dict(), sort_keys=True))
+        self.assertEqual(0, connector.write_calls)
+        leaf = root / ".todo_archive" / "new_system_recovery.json"
+        durable = json.loads(leaf.read_text())
+        self.assertEqual("interrupted", durable["phase"])
+        self.assertEqual(connector.read_calls == 1, durable["read_attempted"])
+        self.assertFalse(durable["write_attempted"])
+        self.assertFalse(durable["write_started"])
+        resumed = RecoveryJournal(root).resume_review().to_public_dict()
+        self.assertEqual("fresh-review-required", resumed["status"])
+        self.assertEqual("fresh-reinspection", resumed["classification"])
+        self.assertFalse(resumed["write_authority"])
+        return connector
+
+    def test_post_prepared_action_drift_has_zero_io_and_truthful_restart_facts(self):
+        connector = self.assert_archive_drift_facts("prepared")
+        self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+
+    def test_post_read_completed_action_drift_has_read_only_facts(self):
+        connector = self.assert_archive_drift_facts("read-completed")
+        self.assertEqual((1, 0), (connector.read_calls, connector.write_calls))
+
+    def test_post_durable_pre_io_gate_drift_never_claims_write_attempted(self):
+        connector = self.assert_archive_drift_facts("write-ready")
+        self.assertEqual((1, 0), (connector.read_calls, connector.write_calls))
+
+    def test_adapter_pre_io_revocation_after_write_ready_records_no_write_attempt(self):
+        ledger, envelope, adapter, connector, journal = self.system(
+            root=self.root / "adapter-pre-io-revoked"
+        )
+        original = RecoveryJournal.transition
+
+        def transition(instance, phase, supplied):
+            result = original(instance, phase, supplied)
+            if instance is journal and phase == "write-ready":
+                adapter.read_exact({})
+            return result
+
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = self.execute(
+                WriteCoordinator(ledger), envelope, adapter, journal
+            )
+
+        self.assertFalse(result.authorized)
+        self.assertEqual((1, 0), (connector.read_calls, connector.write_calls))
+        leaf = self.root / "adapter-pre-io-revoked" / ".todo_archive" / "new_system_recovery.json"
+        durable = json.loads(leaf.read_text())
+        self.assertEqual(
+            ("interrupted", True, False, False),
+            tuple(
+                durable[key]
+                for key in (
+                    "phase",
+                    "read_attempted",
+                    "write_attempted",
+                    "write_started",
+                )
+            ),
+        )
+        resumed = RecoveryJournal(self.root / "adapter-pre-io-revoked").resume_review().to_public_dict()
+        self.assertEqual("fresh-reinspection", resumed["classification"])
+        self.assertFalse(resumed["write_authority"])
+
+    def test_trusted_adapter_attempt_evidence_drives_durable_write_facts(self):
+        for index, (outcome, terminal) in enumerate((
+            ("success", "confirmed-applied"),
+            (RuntimeError(CANARY), "outcome-unknown"),
+            ("ambiguous", "outcome-unknown"),
+            ("partial", "possible-partial"),
+        )):
+            with self.subTest(outcome=type(outcome).__name__ + str(outcome)):
+                root = self.root / ("attempt-evidence-" + str(index))
+                ledger, envelope, adapter, connector, journal = self.system(root=root, write=outcome)
+                self.execute(WriteCoordinator(ledger), envelope, adapter, journal)
+                self.assertEqual((1, 1), (connector.read_calls, connector.write_calls))
+                durable = json.loads((root / ".todo_archive" / "new_system_recovery.json").read_text())
+                self.assertEqual(terminal, durable["phase"])
+                self.assertTrue(durable["write_attempted"])
+                self.assertTrue(durable["write_started"])
+
+    def test_dynamic_or_noncanonical_adapter_cannot_forge_attempt_evidence(self):
+        class DynamicOutcome:
+            def __getattr__(self, _name):
+                raise RuntimeError(CANARY)
+
+        class MaliciousAdapter:
+            def __init__(self):
+                self.read_calls = self.write_calls = 0
+            def read_exact(self, _action):
+                self.read_calls += 1
+                return state()
+            def write_once(self, _action):
+                self.write_calls += 1
+                return DynamicOutcome()
+
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(ledger.preview(action(), state()), accepted=True)
+        adapter = MaliciousAdapter()
+        journal = RecoveryJournal(self.root / "malicious-adapter")
+        result = WriteCoordinator(ledger).run(
+            envelope, action(), state(), adapter, recovery_journal=journal
+        )
+        self.assertFalse(result.authorized)
+        self.assertEqual((0, 0), (adapter.read_calls, adapter.write_calls))
+        self.assertFalse(result.write_attempted)
+        public = json.dumps(result.to_public_dict(), sort_keys=True)
+        self.assertNotIn(CANARY, public)
+
+    def test_restore_then_change_combination_uses_snapshot_and_still_stops_write(self):
+        current_holder = {}
+
+        class RestoreConnector(Connector):
+            def read_canonical(self, request):
+                current = current_holder["action"]
+                current["payload"]["display_name"] = "Archive B"
+                current["payload"]["display_name"] = "Archive A"
+                return super().read_canonical(request)
+
+        current = archive_action("Archive A")
+        current_holder["action"] = current
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(ledger.preview(current, state()), accepted=True)
+        connector = RestoreConnector()
+        root = self.root / "restore-then-change"
+        journal = RecoveryJournal(root)
+        original = RecoveryJournal.transition
+        def transition(instance, phase, supplied):
+            result = original(instance, phase, supplied)
+            if instance is journal and phase == "read-completed":
+                current["payload"]["display_name"] = "Archive B"
+            return result
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = WriteCoordinator(ledger).run(envelope, current, state(), CanonicalConnectorActionAdapter(connector), recovery_journal=journal)
+        self.assertFalse(result.authorized)
+        self.assertEqual((1, 0), (connector.read_calls, connector.write_calls))
+        durable = json.loads((root / ".todo_archive" / "new_system_recovery.json").read_text())
+        self.assertEqual(("interrupted", True, False, False), tuple(durable[key] for key in ("phase", "read_attempted", "write_attempted", "write_started")))
+        resumed = RecoveryJournal(root).resume_review().to_public_dict()
+        self.assertEqual("fresh-reinspection", resumed["classification"])
+        self.assertNotIn("Archive", json.dumps(result.to_public_dict(), sort_keys=True))
+
     def test_each_journal_phase_failure_stops_at_the_factual_io_boundary(self):
-        limits = {"prepared": (0, 0), "read-completed": (1, 0), "write-started": (1, 0)}
+        limits = {"prepared": (0, 0), "read-completed": (1, 0), "write-ready": (1, 0), "write-started": (1, 1)}
         for failed, expected in limits.items():
             with self.subTest(failed=failed):
                 root = self.root / ("exception-" + failed); ledger, envelope, adapter, connector, journal = self.system(root=root); original = RecoveryJournal.transition
@@ -140,7 +393,7 @@ class T9RedGate(unittest.TestCase):
                     self.assertEqual((1, 1), (connector.read_calls, connector.write_calls)); self.assertFalse(retry.to_public_dict().get("write_authority", False))
 
     def test_rejected_prewrite_transition_result_blocks_the_matching_boundary(self):
-        limits = {"prepared": (0, 0), "read-completed": (1, 0), "write-started": (1, 0)}
+        limits = {"prepared": (0, 0), "read-completed": (1, 0), "write-ready": (1, 0), "write-started": (1, 1)}
         class Rejected:
             def to_public_dict(self): return {"status": "rejected", "phase": None, "classification": "fresh-reinspection", "failure_class": "storage-failed", "write_authority": False, "review_generated": False}
         for failed, expected in limits.items():
@@ -162,12 +415,13 @@ class T9RedGate(unittest.TestCase):
                 self.assertEqual((1, 1), (connector.read_calls, connector.write_calls))
 
     def test_restart_pending_and_inflight_journals_are_review_only(self):
-        for phase in ("prepared", "read-completed", "write-started", "confirmed-applied"):
+        for phase in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"):
             with self.subTest(phase=phase):
                 root = self.root / ("restart-" + phase); ledger, envelope, adapter, connector, initial = self.system(root=root)
                 initial.transition("prepared", facts("a" * 64, "b" * 32, "prepared"))
                 if phase != "prepared": initial.transition("read-completed", facts("a" * 64, "b" * 32, "read-completed"))
-                if phase not in {"prepared", "read-completed"}: initial.transition("write-started", facts("a" * 64, "b" * 32, "write-started"))
+                if phase not in {"prepared", "read-completed"}: initial.transition("write-ready", facts("a" * 64, "b" * 32, "write-ready"))
+                if phase in {"write-started", "confirmed-applied"}: initial.transition("write-started", facts("a" * 64, "b" * 32, "write-started"))
                 if phase == "confirmed-applied": initial.transition("confirmed-applied", facts("a" * 64, "b" * 32, "confirmed-applied"))
                 result = self.execute(WriteCoordinator(ledger), envelope, adapter, RecoveryJournal(root))
                 self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))

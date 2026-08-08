@@ -71,6 +71,15 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def canonical_action_bytes(action: object) -> bytes:
+    """Return the one canonical UTF-8 representation used across write layers."""
+    return _canonical_bytes(action, "action.not-canonical")
+
+
+def canonical_expected_state_bytes(expected_state: object) -> bytes:
+    return _canonical_bytes(expected_state, "expected-state.invalid")
+
+
 def _freeze(value: object) -> object:
     if isinstance(value, dict):
         return MappingProxyType({key: _freeze(child) for key, child in value.items()})
@@ -85,6 +94,31 @@ def _summary() -> dict[str, object]:
         "target_bound": True,
         "payload_bound": True,
     }
+
+
+def _validate_archive_target_action(
+    kind: object, target: object, payload: object
+) -> None:
+    if kind != "create_archive_target":
+        return
+    if (
+        type(target) is not dict
+        or set(target) != {"container", "category"}
+        or any(type(value) is not str or _is_placeholder(value) for value in target.values())
+        or type(payload) is not dict
+        or set(payload) != {"display_name", "schema"}
+        or type(payload["display_name"]) is not str
+        or _is_placeholder(payload["display_name"])
+        or type(payload["schema"]) is not dict
+        or not payload["schema"]
+    ):
+        raise PreviewInputError("action.invalid")
+    try:
+        display_name_bytes = len(payload["display_name"].encode("utf-8"))
+    except UnicodeError:
+        raise PreviewInputError("action.invalid") from None
+    if display_name_bytes > 128:
+        raise PreviewInputError("action.invalid")
 
 
 class GuidedAction:
@@ -102,7 +136,7 @@ class GuidedAction:
         target = action["target"]
         payload = action["payload"]
         if (
-            not isinstance(kind, str)
+            type(kind) is not str
             or _is_placeholder(kind)
             or not isinstance(target, (str, Mapping))
             or not target
@@ -110,7 +144,8 @@ class GuidedAction:
             or not payload
         ):
             raise PreviewInputError("action.invalid")
-        canonical = _canonical_bytes(action, "action.not-canonical")
+        _validate_archive_target_action(kind, target, payload)
+        canonical = canonical_action_bytes(action)
         return cls(canonical, _digest(canonical))
 
     @property
@@ -131,6 +166,7 @@ class ActionPreview:
     __slots__ = (
         "_action",
         "_state_digest",
+        "_state_canonical",
         "_binding_digest",
         "_trusted",
     )
@@ -138,10 +174,12 @@ class ActionPreview:
     def __init__(
         self,
         action: GuidedAction,
+        state_canonical: bytes,
         state_digest: str,
         binding_digest: str,
     ):
         self._action = action
+        self._state_canonical = state_canonical
         self._state_digest = state_digest
         self._binding_digest = binding_digest
         self._trusted = False
@@ -184,9 +222,10 @@ def preview_next_action(action: object, expected_state: object) -> ActionPreview
     guided_action = GuidedAction.from_mapping(action)
     if not isinstance(expected_state, Mapping) or not expected_state:
         raise PreviewInputError("expected-state.invalid")
-    state_digest = _digest(_canonical_bytes(expected_state, "expected-state.invalid"))
+    state_canonical = canonical_expected_state_bytes(expected_state)
+    state_digest = _digest(state_canonical)
     binding = _digest(f"{guided_action.digest}:{state_digest}".encode("ascii"))
-    return ActionPreview(guided_action, state_digest, binding)
+    return ActionPreview(guided_action, state_canonical, state_digest, binding)
 
 
 @dataclass(frozen=True, eq=False)
@@ -221,12 +260,16 @@ class _ClaimDecision:
     claim: AttemptClaim | None
     action_digest: str | None
     attempt_fingerprint: str | None
+    action_canonical: bytes | None
+    expected_state_canonical: bytes | None
 
 
 @dataclass
 class _ApprovalRecord:
     binding_digest: str
     action_digest: str
+    action_canonical: bytes
+    expected_state_canonical: bytes
     state: str = "pending"
     claim: AttemptClaim | None = None
     attempt_fingerprint: str | None = None
@@ -244,7 +287,7 @@ class AuthorizationDecision:
 
 class ApprovalLedger:
     def __init__(self) -> None:
-        self._previews: dict[ActionPreview, tuple[str, str, str, bytes, bool]] = {}
+        self._previews: dict[ActionPreview, tuple[str, str, str, bytes, bytes, bool]] = {}
         self._approvals: dict[ApprovalEnvelope, _ApprovalRecord] = {}
         self._claims: dict[AttemptClaim, ApprovalEnvelope] = {}
         self._lock = threading.Lock()
@@ -258,6 +301,7 @@ class ApprovalLedger:
                 preview.action_digest,
                 preview.expected_state_digest,
                 preview._action._canonical,
+                preview._state_canonical,
                 False,
             )
         return preview
@@ -270,33 +314,38 @@ class ApprovalLedger:
             if (
                 record is None
                 or not preview._trusted
-                or record[4]
+                or record[5]
                 or record[0] != preview.binding_digest
                 or record[1] != preview.action_digest
                 or record[2] != preview.expected_state_digest
                 or record[3] != preview._action._canonical
+                or record[4] != preview._state_canonical
             ):
                 return None
-            self._previews[preview] = (*record[:4], True)
+            self._previews[preview] = (*record[:5], True)
             if accepted is not True:
                 return None
             envelope = ApprovalEnvelope()
-            self._approvals[envelope] = _ApprovalRecord(record[0], record[1])
+            self._approvals[envelope] = _ApprovalRecord(
+                record[0], record[1], record[3], record[4]
+            )
             return envelope
 
     def claim_for_write(self, envelope: object) -> _ClaimDecision:
         if type(envelope) is not ApprovalEnvelope:
-            return _ClaimDecision("approval.required", None, None, None)
+            return _ClaimDecision("approval.required", None, None, None, None, None)
         with self._lock:
             record = self._approvals.get(envelope)
             if record is None:
-                return _ClaimDecision("approval.unknown", None, None, None)
+                return _ClaimDecision("approval.unknown", None, None, None, None, None)
             if record.state == "consumed":
                 return _ClaimDecision(
                     "approval.consumed",
                     None,
                     record.action_digest,
                     record.attempt_fingerprint,
+                    None,
+                    None,
                 )
             if record.state == "in-progress":
                 return _ClaimDecision(
@@ -304,6 +353,8 @@ class ApprovalLedger:
                     None,
                     record.action_digest,
                     record.attempt_fingerprint,
+                    None,
+                    None,
                 )
             claim = AttemptClaim()
             record.state = "in-progress"
@@ -315,6 +366,8 @@ class ApprovalLedger:
                 claim,
                 record.action_digest,
                 record.attempt_fingerprint,
+                record.action_canonical,
+                record.expected_state_canonical,
             )
 
     def _evaluate_consumed(

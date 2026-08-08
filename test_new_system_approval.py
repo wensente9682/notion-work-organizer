@@ -4,6 +4,7 @@ import json
 import math
 import threading
 import unittest
+import hashlib
 from collections.abc import Mapping
 
 from new_system_approval import (
@@ -42,7 +43,86 @@ def expected_state():
     return {"parent": {"id": CANARY_ID}, "state": CANARY_STATE}
 
 
+def archive_action(display_name="Synthetic Archive"):
+    return {
+        "kind": "create_archive_target",
+        "target": {"container": "synthetic-container", "category": "slot-1"},
+        "payload": {
+            "display_name": display_name,
+            "schema": {"Task": "title"},
+        },
+    }
+
+
 class NewSystemApprovalTests(unittest.TestCase):
+    def test_ascii_and_unicode_actions_share_one_canonical_utf8_digest_contract(self):
+        from new_system_approval import canonical_action_bytes
+
+        for title, literal in (
+            (
+                "Archive",
+                b'{"kind":"create_archive_target","payload":{"display_name":"Archive","schema":{"Task":"title"}},"target":{"category":"slot-1","container":"synthetic-container"}}',
+            ),
+            (
+                "研究 é",
+                '{"kind":"create_archive_target","payload":{"display_name":"研究 é","schema":{"Task":"title"}},"target":{"category":"slot-1","container":"synthetic-container"}}'.encode("utf-8"),
+            ),
+        ):
+            with self.subTest(title=title):
+                current = archive_action(title)
+                self.assertEqual(literal, canonical_action_bytes(current))
+                expected = hashlib.sha256(literal).hexdigest()
+                self.assertEqual(
+                    expected,
+                    preview_next_action(current, expected_state()).action_digest,
+                )
+
+    def test_archive_display_name_is_bound_by_preview_digest_and_approval(self):
+        first = preview_next_action(archive_action("Archive A"), expected_state())
+        second = preview_next_action(archive_action("Archive B"), expected_state())
+        self.assertNotEqual(first.action_digest, second.action_digest)
+
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(
+            ledger.preview(archive_action("Archive A"), expected_state()),
+            accepted=True,
+        )
+        decision = ledger.consume(
+            envelope,
+            archive_action("Archive B"),
+            expected_state(),
+        )
+        self.assertEqual("approval.binding-mismatch", decision.code)
+        self.assertFalse(decision.authorized)
+
+    def test_archive_preview_rejects_missing_malformed_and_over_limit_display_name(self):
+        class TextSubclass(str):
+            pass
+
+        missing = archive_action()
+        del missing["payload"]["display_name"]
+        cases = (
+            missing,
+            archive_action(""),
+            archive_action("   "),
+            archive_action(TextSubclass("Synthetic Archive")),
+            archive_action(None),
+            archive_action(1),
+            archive_action("a" * 129),
+            archive_action("界" * 43),
+        )
+        for candidate in cases:
+            with self.subTest(value=type(candidate["payload"].get("display_name")).__name__):
+                with self.assertRaises(PreviewInputError):
+                    preview_next_action(candidate, expected_state())
+
+        self.assertEqual(
+            "a" * 128,
+            preview_next_action(
+                archive_action("a" * 128), expected_state()
+            ).review_action()["payload"]["display_name"],
+        )
+
     def test_opaque_subclasses_are_rejected_before_protocol_calls(self):
         calls = []
 

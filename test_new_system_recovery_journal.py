@@ -33,14 +33,14 @@ def facts(**changes):
 def facts_for(event, interrupted_from=None, **changes):
     """Independent frozen-state oracle; it does not mirror implementation code."""
     values = facts()
-    if event in {"read-completed", "write-started", "confirmed-applied",
+    if event in {"read-completed", "write-ready", "write-started", "confirmed-applied",
                  "confirmed-not-applied", "outcome-unknown", "possible-partial", "consumed"}:
         values["read_attempted"] = True
     if event in {"write-started", "confirmed-applied", "confirmed-not-applied",
                  "outcome-unknown", "possible-partial", "consumed"}:
         values.update(write_attempted=True, write_started=True)
     if event == "interrupted":
-        if interrupted_from in {"read-completed", "write-started"}:
+        if interrupted_from in {"read-completed", "write-ready", "write-started"}:
             values["read_attempted"] = True
         if interrupted_from == "write-started":
             values.update(write_attempted=True, write_started=True)
@@ -99,11 +99,20 @@ class RecoveryJournalRedGate(unittest.TestCase):
         self.assertEqual("prepared", subject.transition("prepared", facts_for("prepared")).to_public_dict()["phase"])
         self.assertEqual("rejected", subject.clear_terminal().to_public_dict()["status"])
 
+    def test_write_started_requires_the_mandatory_write_ready_gate(self):
+        subject = journal(self.root)
+        self.assertEqual("accepted", subject.transition("prepared", facts_for("prepared")).to_public_dict()["status"])
+        self.assertEqual("accepted", subject.transition("read-completed", facts_for("read-completed")).to_public_dict()["status"])
+        rejected = subject.transition("write-started", facts_for("write-started")).to_public_dict()
+        self.assertEqual("rejected", rejected["status"])
+        self.assertFalse(rejected["write_authority"])
+
     def test_frozen_graph_each_source_has_legal_and_illegal_symmetric_events(self):
         paths = (
             (("prepared",), ("read-completed", "interrupted"), "write-started"),
-            (("prepared", "read-completed"), ("write-started", "interrupted"), "confirmed-applied"),
-            (("prepared", "read-completed", "write-started"),
+            (("prepared", "read-completed"), ("write-ready", "interrupted"), "write-started"),
+            (("prepared", "read-completed", "write-ready"), ("write-started", "interrupted"), "prepared"),
+            (("prepared", "read-completed", "write-ready", "write-started"),
              ("confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial", "interrupted"), "prepared"),
         )
         for prefix, legal, illegal in paths:
@@ -127,6 +136,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
                 subject = journal(self.root / phase)
                 subject.transition("prepared", facts_for("prepared"))
                 subject.transition("read-completed", facts_for("read-completed"))
+                subject.transition("write-ready", facts_for("write-ready"))
                 subject.transition("write-started", facts_for("write-started"))
                 if phase == "consumed":
                     subject.transition("confirmed-applied", facts_for("confirmed-applied"))
@@ -134,15 +144,40 @@ class RecoveryJournalRedGate(unittest.TestCase):
                 self.assertEqual("rejected", subject.transition("prepared", facts_for("prepared")).to_public_dict()["status"])
                 self.assertEqual(classification, journal(self.root / phase).resume_review().to_public_dict()["status"])
 
-    def test_write_started_and_interrupted_restart_are_possible_partial(self):
-        for event in ("write-started", "interrupted"):
-            with self.subTest(event=event):
-                subject = journal(self.root / event)
+    def test_restart_classification_uses_durable_io_facts_and_pre_io_uncertainty(self):
+        for event, interrupted_from, classification in (
+            ("write-ready", None, "possible-partial"),
+            ("write-started", None, "possible-partial"),
+            ("interrupted", "read-completed", "fresh-reinspection"),
+            ("interrupted", "write-started", "possible-partial"),
+        ):
+            with self.subTest(event=event, interrupted_from=interrupted_from):
+                root = self.root / (event + "-" + classification)
+                subject = journal(root)
                 subject.transition("prepared", facts_for("prepared"))
                 subject.transition("read-completed", facts_for("read-completed"))
-                subject.transition(event, facts_for(event, interrupted_from="read-completed"))
-                public = journal(self.root / event).resume_review().to_public_dict()
-                self.assertEqual("possible-partial", public["classification"])
+                if event == "write-started" or interrupted_from == "write-started":
+                    subject.transition("write-ready", facts_for("write-ready"))
+                    subject.transition("write-started", facts_for("write-started"))
+                if event != "write-started":
+                    subject.transition(event, facts_for(event, interrupted_from=interrupted_from or "read-completed"))
+                if event == "write-ready":
+                    durable = json.loads(
+                        (root / ".todo_archive" / "new_system_recovery.json").read_text()
+                    )
+                    self.assertEqual(
+                        (True, False, False),
+                        tuple(
+                            durable[key]
+                            for key in (
+                                "read_attempted",
+                                "write_attempted",
+                                "write_started",
+                            )
+                        ),
+                    )
+                public = journal(root).resume_review().to_public_dict()
+                self.assertEqual(classification, public["classification"])
                 self.assertFalse(public["write_authority"])
 
     def test_phase_facts_are_independent_and_illegal_combinations_are_rejected(self):
@@ -161,7 +196,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
                 subject = journal(self.root / phase)
                 if phase != "no-record": subject.transition("prepared", facts_for("prepared"))
                 if phase in {"read-completed", "write-started", "consumed"}: subject.transition("read-completed", facts_for("read-completed"))
-                if phase in {"write-started", "consumed"}: subject.transition("write-started", facts_for("write-started"))
+                if phase in {"write-started", "consumed"}: subject.transition("write-ready", facts_for("write-ready")); subject.transition("write-started", facts_for("write-started"))
                 if phase == "consumed": subject.transition("confirmed-applied", facts_for("confirmed-applied")); subject.transition("consumed", facts_for("consumed"))
                 calls = []
                 self.assertEqual("rejected", subject.transition("prepared", facts(extra=DynamicTrap(calls))).to_public_dict()["status"])
@@ -343,6 +378,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
                 self.assertGreaterEqual(called.call_count, 1)
         subject = journal(self.root / "unlink")
         subject.transition("prepared", facts_for("prepared")); subject.transition("read-completed", facts_for("read-completed"))
+        subject.transition("write-ready", facts_for("write-ready"))
         subject.transition("write-started", facts_for("write-started")); subject.transition("confirmed-applied", facts_for("confirmed-applied")); subject.resume_review()
         called = mock.Mock(side_effect=OSError)
         with mock.patch("new_system_recovery_journal.os.unlink", called):
@@ -408,10 +444,10 @@ class RecoveryJournalRedGate(unittest.TestCase):
                 subject = journal(self.root / phase)
                 todo = self.root / phase / ".todo_archive"; todo.mkdir(parents=True, mode=0o700)
                 if phase in {"outcome-unknown", "possible-partial", "interrupted"}:
-                    subject.transition("prepared", facts_for("prepared")); subject.transition("read-completed", facts_for("read-completed")); subject.transition("write-started", facts_for("write-started"))
+                    subject.transition("prepared", facts_for("prepared")); subject.transition("read-completed", facts_for("read-completed")); subject.transition("write-ready", facts_for("write-ready")); subject.transition("write-started", facts_for("write-started"))
                     subject.transition(phase, facts_for(phase, interrupted_from="write-started"))
                 elif phase == "inflight":
-                    subject.transition("prepared", facts_for("prepared")); subject.transition("read-completed", facts_for("read-completed")); subject.transition("write-started", facts_for("write-started"))
+                    subject.transition("prepared", facts_for("prepared")); subject.transition("read-completed", facts_for("read-completed")); subject.transition("write-ready", facts_for("write-ready")); subject.transition("write-started", facts_for("write-started"))
                 elif phase == "stale":
                     subject.transition("prepared", facts_for("prepared"))
                     leaf = todo / "new_system_recovery.json"; before = (leaf.stat().st_ino, leaf.read_bytes())
@@ -426,6 +462,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
             with self.subTest(failure=failure):
                 subject = journal(self.root / failure)
                 subject.transition("prepared", facts_for("prepared")); subject.transition("read-completed", facts_for("read-completed"))
+                subject.transition("write-ready", facts_for("write-ready"))
                 subject.transition("write-started", facts_for("write-started"))
                 subject.transition("confirmed-applied", facts_for("confirmed-applied"))
                 subject.resume_review()
@@ -440,6 +477,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
                 subject = journal(self.root / phase)
                 subject.transition("prepared", facts_for("prepared"))
                 subject.transition("read-completed", facts_for("read-completed"))
+                subject.transition("write-ready", facts_for("write-ready"))
                 subject.transition("write-started", facts_for("write-started"))
                 if phase == "consumed":
                     subject.transition("confirmed-applied", facts_for("confirmed-applied"))
@@ -450,8 +488,8 @@ class RecoveryJournalRedGate(unittest.TestCase):
 
     def test_target_phase_fact_tampering_preserves_prior_record(self):
         cases = (("read-completed", ("prepared",), facts_for("prepared")),
-                 ("write-started", ("prepared", "read-completed"), facts_for("read-completed")),
-                 ("confirmed-applied", ("prepared", "read-completed", "write-started"), facts_for("read-completed")))
+                 ("write-started", ("prepared", "read-completed", "write-ready"), facts_for("read-completed")),
+                 ("confirmed-applied", ("prepared", "read-completed", "write-ready", "write-started"), facts_for("read-completed")))
         for target, prefix, tampered in cases:
             with self.subTest(target=target):
                 root = self.root / ("facts-" + target); subject = journal(root)
@@ -462,10 +500,10 @@ class RecoveryJournalRedGate(unittest.TestCase):
 
     def test_same_different_action_and_replay_across_lifecycle(self):
         cases = (("prepared", ("prepared",), "read-completed"),
-                 ("read-completed", ("prepared", "read-completed"), "write-started"),
-                 ("write-started", ("prepared", "read-completed", "write-started"), "confirmed-applied"),
-                 ("confirmed-applied", ("prepared", "read-completed", "write-started", "confirmed-applied"), "consumed"),
-                 ("consumed", ("prepared", "read-completed", "write-started", "confirmed-applied", "consumed"), None))
+                 ("read-completed", ("prepared", "read-completed"), "write-ready"),
+                 ("write-started", ("prepared", "read-completed", "write-ready", "write-started"), "confirmed-applied"),
+                 ("confirmed-applied", ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"), "consumed"),
+                 ("consumed", ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied", "consumed"), None))
         for name, prefix, next_event in cases:
             with self.subTest(phase=name):
                 root = self.root / ("actions-" + name); subject = journal(root)
@@ -570,7 +608,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
         for boundary in ("unlink", "directory-fsync"):
             with self.subTest(boundary=boundary):
                 root = self.root / ("cleanup-" + boundary); subject = journal(root)
-                for event in ("prepared", "read-completed", "write-started", "confirmed-applied"):
+                for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"):
                     subject.transition(event, facts_for(event))
                 subject.resume_review(); leaf = root / ".todo_archive" / "new_system_recovery.json"; replacement = b"replacement"; hit = []
                 if boundary == "unlink":
@@ -590,7 +628,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
 
     def test_identity_drift_before_unlink_preserves_replacement_and_saved_leaf(self):
         root = self.root / "unlink-identity"; subject = journal(root)
-        for event in ("prepared", "read-completed", "write-started", "confirmed-applied"):
+        for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"):
             subject.transition(event, facts_for(event))
         subject.resume_review(); leaf = root / ".todo_archive" / "new_system_recovery.json"
         original_inode, original = leaf.stat().st_ino, leaf.read_bytes(); saved = Path(str(leaf) + ".saved"); replacement = b"replacement"; real_stat, real_unlink = os.stat, os.unlink; journal_stat_calls = []; initial_seen = []; final_hook_seen = []; unlink_order = []
@@ -624,7 +662,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
         for entry in ("transition", "resume_review", "clear_terminal"):
             with self.subTest(entry=entry):
                 root = self.root / ("read-swap-" + entry); subject = journal(root)
-                for event in ("prepared", "read-completed", "write-started", "confirmed-applied"):
+                for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"):
                     subject.transition(event, facts_for(event))
                 subject.resume_review(); leaf = root / ".todo_archive" / "new_system_recovery.json"; original = leaf.read_bytes(); real_stat = os.stat; swapped = []
                 def swap_after_stat(path, *args, **kwargs):
@@ -736,7 +774,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
 
     def test_cleanup_directory_fsync_failure_closes_fd(self):
         root = self.root / "clear-fsync-close"; subject = journal(root)
-        for event in ("prepared", "read-completed", "write-started", "confirmed-applied"): subject.transition(event, facts_for(event))
+        for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"): subject.transition(event, facts_for(event))
         subject.resume_review(); closed = []; real_close, real_fsync = os.close, os.fsync
         def close(fd): closed.append(fd); return real_close(fd)
         def fail_dir(fd):
@@ -850,7 +888,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
         importlib.reload(sys.modules["new_system_recovery_journal"])
         assert_public(self, journal(root).resume_review(), "fresh-review-required")
         root = self.root / "sentinel-clear-reload"; subject = journal(root)
-        for event in ("prepared", "read-completed", "write-started", "confirmed-applied"): subject.transition(event, facts_for(event))
+        for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"): subject.transition(event, facts_for(event))
         subject.resume_review()
         def fail_cleanup_dir(fd):
             if stat.S_ISDIR(os.fstat(fd).st_mode): raise OSError("private")
@@ -883,6 +921,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
         with mock.patch("new_system_recovery_journal.os.open", side_effect=record_open):
             subject.transition("prepared", facts_for("prepared"))
             subject.transition("read-completed", facts_for("read-completed"))
+            subject.transition("write-ready", facts_for("write-ready"))
             subject.transition("write-started", facts_for("write-started"))
             subject.transition("confirmed-applied", facts_for("confirmed-applied"))
             subject.resume_review(); subject.clear_terminal()
@@ -894,7 +933,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
             with self.subTest(entry=entry):
                 root = self.root / ("sentinel-cleanup-" + entry); subject = journal(root)
                 if entry != "transition":
-                    for event in ("prepared", "read-completed", "write-started", "confirmed-applied"):
+                    for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"):
                         subject.transition(event, facts_for(event))
                     if entry == "clear_terminal": subject.resume_review()
                 real_stat, real_unlink = os.stat, os.unlink; swapped = []; unlinks = []
@@ -920,7 +959,7 @@ class RecoveryJournalRedGate(unittest.TestCase):
             with self.subTest(entry=entry):
                 root = self.root / ("sentinel-unlink-error-" + entry); subject = journal(root)
                 if entry != "transition":
-                    for event in ("prepared", "read-completed", "write-started", "confirmed-applied"):
+                    for event in ("prepared", "read-completed", "write-ready", "write-started", "confirmed-applied"):
                         subject.transition(event, facts_for(event))
                     if entry == "clear_terminal": subject.resume_review()
                 real_unlink, hit = os.unlink, []
