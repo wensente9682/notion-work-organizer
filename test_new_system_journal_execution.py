@@ -37,7 +37,11 @@ def archive_action(display_name="Synthetic Archive"):
         "target": {"container": CANARY_ID, "category": "slot-1"},
         "payload": {
             "display_name": display_name,
-            "schema": {"Task": "title"},
+            "schema": {
+                "Task": "title",
+                "Takeaway": "rich_text",
+                "Improvement": "rich_text",
+            },
         },
     }
 
@@ -147,7 +151,7 @@ class T9RedGate(unittest.TestCase):
         expected_request = {
             "parent": {"page_id": CANARY_ID},
             "title": "研究 é",
-            "schema": {"Task": "title"},
+            "schema": 'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, "Improvement" RICH_TEXT)',
         }
         self.assertEqual("completed", result.status)
         self.assertEqual(expected_request, connector.read_request)
@@ -182,6 +186,78 @@ class T9RedGate(unittest.TestCase):
             )
 
         self.assertFalse(result.authorized)
+        self.assertEqual([], transitions)
+        self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+
+    def test_archive_schema_change_after_approval_fails_before_journal_or_connector_io(self):
+        current = archive_action()
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(ledger.preview(current, state()), accepted=True)
+        current["payload"]["schema"] = {
+            "Task": "title",
+            "Takeaway": "rich_text",
+        }
+        connector = Connector()
+        transitions = []
+        journal = RecoveryJournal(self.root / "schema-drift")
+        original = RecoveryJournal.transition
+
+        def transition(instance, phase, supplied):
+            if instance is journal:
+                transitions.append(phase)
+            return original(instance, phase, supplied)
+
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = WriteCoordinator(ledger).run(
+                envelope,
+                current,
+                state(),
+                CanonicalConnectorActionAdapter(connector),
+                recovery_journal=journal,
+            )
+
+        self.assertFalse(result.authorized)
+        self.assertEqual([], transitions)
+        self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+
+    def test_archive_dynamic_schema_protocol_fails_before_journal_or_connector_io(self):
+        calls = []
+
+        class EvilText(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, _other):
+                calls.append("eq")
+                raise RuntimeError(CANARY)
+
+        approved_action = archive_action()
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(
+            ledger.preview(approved_action, state()), accepted=True
+        )
+        supplied = archive_action()
+        supplied["payload"]["schema"]["Task"] = EvilText("title")
+        connector = Connector()
+        journal = RecoveryJournal(self.root / "dynamic-schema")
+        transitions = []
+        original = RecoveryJournal.transition
+
+        def transition(instance, phase, facts):
+            if instance is journal:
+                transitions.append(phase)
+            return original(instance, phase, facts)
+
+        with mock.patch.object(RecoveryJournal, "transition", new=transition):
+            result = WriteCoordinator(ledger).run(
+                envelope,
+                supplied,
+                state(),
+                CanonicalConnectorActionAdapter(connector),
+                recovery_journal=journal,
+            )
+
+        self.assertFalse(result.authorized)
+        self.assertEqual([], calls)
         self.assertEqual([], transitions)
         self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
 

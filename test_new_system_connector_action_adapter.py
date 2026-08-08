@@ -4,6 +4,7 @@ import copy
 import json
 import threading
 import unittest
+from types import MappingProxyType
 
 from new_system_approval import ApprovalEnvelope, ApprovalLedger
 from new_system_write_coordinator import ReadFailure, WriteCoordinator
@@ -50,7 +51,11 @@ def archive_action(display_name="Synthetic Archive"):
         "target": {"container": "synthetic-container", "category": "slot-1"},
         "payload": {
             "display_name": display_name,
-            "schema": {"Task": "title"},
+            "schema": {
+                "Task": "title",
+                "Takeaway": "rich_text",
+                "Improvement": "rich_text",
+            },
         },
     }
 
@@ -104,6 +109,82 @@ def approved(ledger, current_action=None, expected=None):
 
 
 class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
+    def test_archive_mapping_protocol_and_str_subclass_bypasses_are_zero_io(self):
+        calls = []
+
+        class EvilText(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, _other):
+                calls.append("eq")
+                raise RuntimeError(CANARY)
+
+        candidates = [MappingProxyType(archive_action())]
+        for location in ("target", "payload"):
+            candidate = archive_action()
+            candidate[location] = MappingProxyType(candidate[location])
+            candidates.append(candidate)
+        candidate = archive_action()
+        candidate["payload"]["schema"] = MappingProxyType(
+            candidate["payload"]["schema"]
+        )
+        candidates.append(candidate)
+        kind = archive_action()
+        kind["kind"] = EvilText("create_archive_target")
+        candidates.append(kind)
+        key = archive_action()
+        key["payload"]["schema"] = {
+            EvilText("Task"): "title",
+            "Takeaway": "rich_text",
+            "Improvement": "rich_text",
+        }
+        candidates.append(key)
+        value = archive_action()
+        value["payload"]["schema"]["Task"] = EvilText("title")
+        candidates.append(value)
+
+        for candidate in candidates:
+            connector = SyntheticConnector()
+            result = adapter(connector).read_exact(candidate)
+            self.assertIsInstance(result, ReadFailure)
+            self.assertEqual("invalid-action", result.to_public_dict()["failure_class"])
+            self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+        self.assertEqual([], calls)
+
+    def test_archive_projection_tamper_and_dynamic_ddl_are_zero_io(self):
+        from new_system_approval import canonical_action_bytes
+
+        cases = []
+        tampered = json.loads(canonical_action_bytes(archive_action()))
+        tampered["connector_projection"]["request"]["schema"] = "CREATE TABLE arbitrary"
+        cases.append(tampered)
+        reordered = json.loads(canonical_action_bytes(archive_action()))
+        reordered["payload"]["schema"] = {
+            "Takeaway": "rich_text",
+            "Task": "title",
+            "Improvement": "rich_text",
+        }
+        cases.append(reordered)
+
+        class TextSubclass(str):
+            pass
+
+        subclassed = json.loads(canonical_action_bytes(archive_action()))
+        subclassed["connector_projection"]["request"]["schema"] = TextSubclass(
+            subclassed["connector_projection"]["request"]["schema"]
+        )
+        cases.append(subclassed)
+        dynamic = archive_action()
+        dynamic["connector_projection"] = DynamicTrap([])
+        cases.append(dynamic)
+
+        for candidate in cases:
+            connector = SyntheticConnector()
+            result = adapter(connector).read_exact(candidate)
+            self.assertIsInstance(result, ReadFailure)
+            self.assertEqual((0, 0), (connector.read_calls, connector.write_calls))
+            self.assertEqual("invalid-action", result.to_public_dict()["failure_class"])
+
     def test_archive_display_name_is_required_and_maps_to_create_database_title(self):
         class CapturingConnector(SyntheticConnector):
             def read_canonical(self, request):
@@ -121,7 +202,7 @@ class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
             {
                 "parent": {"page_id": "synthetic-container"},
                 "title": "Synthetic Archive",
-                "schema": {"Task": "title"},
+                "schema": 'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, "Improvement" RICH_TEXT)',
             },
             connector.read_request,
         )
@@ -147,7 +228,7 @@ class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
             ("configure_property", {"database": "synthetic", "property": "Category"}, {"type": "select"}),
             ("configure_view_sort", {"database": "synthetic", "view": "ordered"}, {"sort": "Work Date DESC"}),
             ("create_archive_container", {"parent": "synthetic-parent"}, {"title": "archive"}),
-            ("create_archive_target", {"container": "synthetic-container", "category": "slot-1"}, {"display_name": "Synthetic Archive", "schema": {"title": "synthetic"}}),
+            ("create_archive_target", {"container": "synthetic-container", "category": "slot-1"}, {"display_name": "Synthetic Archive", "schema": {"Task": "title", "Takeaway": "rich_text", "Improvement": "rich_text"}}),
         )
         for kind, target, payload in cases:
             with self.subTest(family=kind):

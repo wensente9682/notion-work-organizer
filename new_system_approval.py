@@ -13,6 +13,15 @@ from typing import Mapping
 
 
 _PLACEHOLDERS = {"TODO", "TBD", "PLACEHOLDER", "UNKNOWN", "?"}
+_ARCHIVE_SCHEMA_ITEMS = (
+    ("Task", "title"),
+    ("Takeaway", "rich_text"),
+    ("Improvement", "rich_text"),
+)
+_ARCHIVE_SCHEMA_DDL = (
+    'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, '
+    '"Improvement" RICH_TEXT)'
+)
 
 
 class PreviewInputError(ValueError):
@@ -71,9 +80,99 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _archive_connector_projection(target: dict[str, object], payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "operation": "create_database",
+        "request": {
+            "parent": {"page_id": target["container"]},
+            "title": payload["display_name"],
+            "schema": _ARCHIVE_SCHEMA_DDL,
+        },
+    }
+
+
+def _has_exact_keys(value: object, expected: set[str]) -> bool:
+    if type(value) is not dict:
+        return False
+    keys = tuple(dict.keys(value))
+    return all(type(key) is str for key in keys) and set(keys) == expected
+
+
+def _exact_archive_projection(value: object, expected: dict[str, object]) -> bool:
+    if not _has_exact_keys(value, {"operation", "request"}):
+        return False
+    request = dict.__getitem__(value, "request")
+    expected_request = expected["request"]
+    if (
+        type(dict.__getitem__(value, "operation")) is not str
+        or value["operation"] != "create_database"
+        or not _has_exact_keys(request, {"parent", "title", "schema"})
+        or not _has_exact_keys(request["parent"], {"page_id"})
+    ):
+        return False
+    return (
+        type(request["parent"].get("page_id")) is str
+        and type(request.get("title")) is str
+        and type(request.get("schema")) is str
+        and request == expected_request
+    )
+
+
+def _canonical_action_value(action: object) -> object:
+    if type(action) is not dict:
+        return action
+    kind = dict.get(action, "kind")
+    if type(kind) is not str:
+        raise PreviewInputError("action.not-canonical")
+    if kind != "create_archive_target":
+        return action
+    keys = tuple(dict.keys(action))
+    if not all(type(key) is str for key in keys):
+        raise PreviewInputError("action.not-canonical")
+    keys = set(keys)
+    if keys not in (
+        {"kind", "target", "payload"},
+        {"kind", "target", "payload", "connector_projection"},
+    ):
+        raise PreviewInputError("action.not-canonical")
+    target, payload = action.get("target"), action.get("payload")
+    _validate_archive_target_action("create_archive_target", target, payload)
+    projection = _archive_connector_projection(target, payload)
+    if "connector_projection" in action and not _exact_archive_projection(
+        action["connector_projection"], projection
+    ):
+        raise PreviewInputError("action.not-canonical")
+    return {
+        "kind": "create_archive_target",
+        "target": {
+            "container": target["container"],
+            "category": target["category"],
+        },
+        "payload": {
+            "display_name": payload["display_name"],
+            "schema": dict(_ARCHIVE_SCHEMA_ITEMS),
+        },
+        "connector_projection": projection,
+    }
+
+
 def canonical_action_bytes(action: object) -> bytes:
     """Return the one canonical UTF-8 representation used across write layers."""
-    return _canonical_bytes(action, "action.not-canonical")
+    canonical = _canonical_action_value(action)
+    if type(canonical) is dict and canonical.get("kind") == "create_archive_target":
+        try:
+            return json.dumps(
+                _normalize(canonical, "action.not-canonical"),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except PreviewInputError:
+            raise
+        except (TypeError, ValueError):
+            raise PreviewInputError("action.not-canonical") from None
+    return _canonical_bytes(canonical, "action.not-canonical")
 
 
 def canonical_expected_state_bytes(expected_state: object) -> bytes:
@@ -99,18 +198,24 @@ def _summary() -> dict[str, object]:
 def _validate_archive_target_action(
     kind: object, target: object, payload: object
 ) -> None:
+    if type(kind) is not str:
+        raise PreviewInputError("action.invalid")
     if kind != "create_archive_target":
         return
+    schema = payload.get("schema") if type(payload) is dict else None
+    schema_items = tuple(dict.items(schema)) if type(schema) is dict else ()
     if (
-        type(target) is not dict
-        or set(target) != {"container", "category"}
+        not _has_exact_keys(target, {"container", "category"})
         or any(type(value) is not str or _is_placeholder(value) for value in target.values())
-        or type(payload) is not dict
-        or set(payload) != {"display_name", "schema"}
+        or not _has_exact_keys(payload, {"display_name", "schema"})
         or type(payload["display_name"]) is not str
         or _is_placeholder(payload["display_name"])
-        or type(payload["schema"]) is not dict
-        or not payload["schema"]
+        or type(schema) is not dict
+        or not all(
+            type(key) is str and type(value) is str
+            for key, value in schema_items
+        )
+        or schema_items != _ARCHIVE_SCHEMA_ITEMS
     ):
         raise PreviewInputError("action.invalid")
     try:
@@ -130,11 +235,22 @@ class GuidedAction:
 
     @classmethod
     def from_mapping(cls, action: object) -> GuidedAction:
-        if not isinstance(action, Mapping) or set(action) != {"kind", "target", "payload"}:
+        if type(action) is not dict:
             raise PreviewInputError("action.invalid")
-        kind = action["kind"]
-        target = action["target"]
-        payload = action["payload"]
+        action_keys = tuple(dict.keys(action))
+        if not all(type(key) is str for key in action_keys):
+            raise PreviewInputError("action.invalid")
+        keys = set(action_keys)
+        kind = dict.get(action, "kind")
+        if type(kind) is not str:
+            raise PreviewInputError("action.invalid")
+        if keys != {"kind", "target", "payload"} and not (
+            kind == "create_archive_target"
+            and keys == {"kind", "target", "payload", "connector_projection"}
+        ):
+            raise PreviewInputError("action.invalid")
+        target = dict.__getitem__(action, "target")
+        payload = dict.__getitem__(action, "payload")
         if (
             type(kind) is not str
             or _is_placeholder(kind)

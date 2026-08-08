@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from collections.abc import Mapping
 from types import FunctionType, MappingProxyType
@@ -17,7 +18,7 @@ _MAX_CONTAINER = 16
 _MAX_INT_ABS = 1_000_000_000
 _MAX_STRING_BYTES = 128
 _MAX_TOTAL_BYTES = 256
-_MAX_CANONICAL_BYTES = 512
+_MAX_CANONICAL_BYTES = 768
 _SCHEMAS = {
     "create_database": ({"parent"}, {"schema"}),
     "configure_property": ({"database", "property"}, {"type"}),
@@ -166,6 +167,26 @@ def _charge_string(value: str, byte_count: list[int]) -> bool:
 
 
 def _action(action: object):
+    kind = dict.get(action, "kind") if type(action) is dict else None
+    if type(action) is dict and type(kind) is not str:
+        return None
+    if kind == "create_archive_target":
+        try:
+            canonical = canonical_action_bytes(action)
+        except (PreviewInputError, TypeError, ValueError, OverflowError):
+            return None
+        if len(canonical) > _MAX_CANONICAL_BYTES:
+            return None
+        canonical_value = json.loads(canonical)
+        bounded_input = {
+            "kind": canonical_value["kind"],
+            "target": canonical_value["target"],
+            "payload": {"display_name": canonical_value["payload"]["display_name"]},
+        }
+        status, _ = _plain(bounded_input)
+        if status != "ok":
+            return None
+        return hashlib.sha256(canonical).hexdigest(), canonical_value
     status, value = _plain(action)
     if status != "ok" or type(value) is not dict or set(value) != {"kind", "target", "payload"}:
         return None
@@ -200,13 +221,7 @@ def _action(action: object):
 def _connector_request(action: dict[str, object]) -> dict[str, object]:
     if action["kind"] != "create_archive_target":
         return action
-    target = action["target"]
-    payload = action["payload"]
-    return {
-        "parent": {"page_id": target["container"]},
-        "title": payload["display_name"],
-        "schema": payload["schema"],
-    }
+    return action["connector_projection"]["request"]
 
 
 def _connector_method(connector: object, name: str) -> FunctionType | None:

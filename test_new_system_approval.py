@@ -6,6 +6,7 @@ import threading
 import unittest
 import hashlib
 from collections.abc import Mapping
+from types import MappingProxyType
 
 from new_system_approval import (
     ApprovalEnvelope,
@@ -49,23 +50,185 @@ def archive_action(display_name="Synthetic Archive"):
         "target": {"container": "synthetic-container", "category": "slot-1"},
         "payload": {
             "display_name": display_name,
-            "schema": {"Task": "title"},
+            "schema": {
+                "Task": "title",
+                "Takeaway": "rich_text",
+                "Improvement": "rich_text",
+            },
         },
     }
 
 
 class NewSystemApprovalTests(unittest.TestCase):
+    def test_archive_preview_rejects_non_builtin_mapping_protocols(self):
+        calls = []
+
+        class EvilMapping(Mapping):
+            def __getitem__(self, _key):
+                calls.append("getitem")
+                raise RuntimeError(CANARY_TASK)
+
+            def __iter__(self):
+                calls.append("iter")
+                raise RuntimeError(CANARY_TASK)
+
+            def __len__(self):
+                calls.append("len")
+                raise RuntimeError(CANARY_TASK)
+
+        candidates = [MappingProxyType(archive_action()), EvilMapping()]
+        for location in ("target", "payload"):
+            candidate = archive_action()
+            candidate[location] = MappingProxyType(candidate[location])
+            candidates.append(candidate)
+        candidate = archive_action()
+        candidate["payload"]["schema"] = MappingProxyType(
+            candidate["payload"]["schema"]
+        )
+        candidates.append(candidate)
+
+        for candidate in candidates:
+            with self.assertRaises(PreviewInputError):
+                preview_next_action(candidate, expected_state())
+        self.assertEqual([], calls)
+
+    def test_archive_preview_rejects_str_subclasses_without_dynamic_comparison(self):
+        calls = []
+
+        class EvilText(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, _other):
+                calls.append("eq")
+                raise RuntimeError(CANARY_TASK)
+
+        candidates = []
+        kind = archive_action()
+        kind["kind"] = EvilText("create_archive_target")
+        candidates.append(kind)
+        key = archive_action()
+        key["payload"]["schema"] = {
+            EvilText("Task"): "title",
+            "Takeaway": "rich_text",
+            "Improvement": "rich_text",
+        }
+        candidates.append(key)
+        value = archive_action()
+        value["payload"]["schema"]["Task"] = EvilText("title")
+        candidates.append(value)
+
+        for candidate in candidates:
+            with self.assertRaises(PreviewInputError):
+                preview_next_action(candidate, expected_state())
+        self.assertEqual([], calls)
+
+    def test_archive_four_key_preview_rejects_kind_subclasses_before_comparison(self):
+        from new_system_approval import canonical_action_bytes
+
+        calls = []
+
+        class TrueText(str):
+            def __eq__(self, _other):
+                calls.append("true-eq")
+                return True
+
+        class ThrowText(str):
+            def __eq__(self, _other):
+                calls.append("throw-eq")
+                raise RuntimeError(CANARY_TASK)
+
+        for text_type in (TrueText, ThrowText):
+            candidate = json.loads(canonical_action_bytes(archive_action()))
+            candidate["kind"] = text_type("create_archive_target")
+            with self.assertRaises(PreviewInputError) as captured:
+                preview_next_action(candidate, expected_state())
+            self.assertEqual("action.invalid", captured.exception.code)
+        self.assertEqual([], calls)
+
+    def test_archive_preview_binds_exact_mapping_and_connector_ddl(self):
+        preview = preview_next_action(archive_action(), expected_state())
+
+        self.assertEqual(
+            {
+                "operation": "create_database",
+                "request": {
+                    "parent": {"page_id": "synthetic-container"},
+                    "title": "Synthetic Archive",
+                    "schema": 'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, "Improvement" RICH_TEXT)',
+                },
+            },
+            preview.review_action()["connector_projection"],
+        )
+
+    def test_archive_preview_rejects_every_non_frozen_schema(self):
+        schemas = (
+            {"Takeaway": "rich_text", "Task": "title", "Improvement": "rich_text"},
+            {"Task": "title", "Takeaway": "rich_text"},
+            {"Task": "title", "Takeaway": "rich_text", "Improvement": "rich_text", "Extra": "rich_text"},
+            {"Task": "rich_text", "Takeaway": "rich_text", "Improvement": "rich_text"},
+            {"Task\"; DROP TABLE x;--": "title", "Takeaway": "rich_text", "Improvement": "rich_text"},
+            {"Ta\N{CYRILLIC SMALL LETTER ES}k": "title", "Takeaway": "rich_text", "Improvement": "rich_text"},
+        )
+        for schema in schemas:
+            with self.subTest(schema=repr(schema)):
+                candidate = archive_action()
+                candidate["payload"]["schema"] = schema
+                with self.assertRaises(PreviewInputError):
+                    preview_next_action(candidate, expected_state())
+
+    def test_archive_preview_rejects_dynamic_schema_and_tampered_derived_ddl(self):
+        class DynamicMapping(Mapping):
+            def __getitem__(self, _key):
+                raise RuntimeError(CANARY_TASK)
+
+            def __iter__(self):
+                raise RuntimeError(CANARY_TASK)
+
+            def __len__(self):
+                return 3
+
+        dynamic = archive_action()
+        dynamic["payload"]["schema"] = DynamicMapping()
+        with self.assertRaises(PreviewInputError):
+            preview_next_action(dynamic, expected_state())
+
+        from new_system_approval import canonical_action_bytes
+
+        tampered = json.loads(canonical_action_bytes(archive_action()))
+        tampered["connector_projection"]["request"]["schema"] += "; DROP TABLE x"
+        with self.assertRaises(PreviewInputError):
+            preview_next_action(tampered, expected_state())
+
+        reordered = json.loads(canonical_action_bytes(archive_action()))
+        reordered["payload"]["schema"] = {
+            "Takeaway": "rich_text",
+            "Task": "title",
+            "Improvement": "rich_text",
+        }
+        with self.assertRaises(PreviewInputError):
+            preview_next_action(reordered, expected_state())
+
+        class TextSubclass(str):
+            pass
+
+        malformed = json.loads(canonical_action_bytes(archive_action()))
+        malformed["connector_projection"]["request"]["schema"] = TextSubclass(
+            'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, "Improvement" RICH_TEXT)'
+        )
+        with self.assertRaises(PreviewInputError):
+            preview_next_action(malformed, expected_state())
+
     def test_ascii_and_unicode_actions_share_one_canonical_utf8_digest_contract(self):
         from new_system_approval import canonical_action_bytes
 
         for title, literal in (
             (
                 "Archive",
-                b'{"kind":"create_archive_target","payload":{"display_name":"Archive","schema":{"Task":"title"}},"target":{"category":"slot-1","container":"synthetic-container"}}',
+                '{"kind":"create_archive_target","target":{"container":"synthetic-container","category":"slot-1"},"payload":{"display_name":"Archive","schema":{"Task":"title","Takeaway":"rich_text","Improvement":"rich_text"}},"connector_projection":{"operation":"create_database","request":{"parent":{"page_id":"synthetic-container"},"title":"Archive","schema":"CREATE TABLE (\\"Task\\" TITLE, \\"Takeaway\\" RICH_TEXT, \\"Improvement\\" RICH_TEXT)"}}}'.encode("utf-8"),
             ),
             (
                 "研究 é",
-                '{"kind":"create_archive_target","payload":{"display_name":"研究 é","schema":{"Task":"title"}},"target":{"category":"slot-1","container":"synthetic-container"}}'.encode("utf-8"),
+                '{"kind":"create_archive_target","target":{"container":"synthetic-container","category":"slot-1"},"payload":{"display_name":"研究 é","schema":{"Task":"title","Takeaway":"rich_text","Improvement":"rich_text"}},"connector_projection":{"operation":"create_database","request":{"parent":{"page_id":"synthetic-container"},"title":"研究 é","schema":"CREATE TABLE (\\"Task\\" TITLE, \\"Takeaway\\" RICH_TEXT, \\"Improvement\\" RICH_TEXT)"}}}'.encode("utf-8"),
             ),
         ):
             with self.subTest(title=title):
