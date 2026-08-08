@@ -477,18 +477,27 @@ class WriteCoordinator:
             return stop("authority-drift", read=True, phase="authorize")
         try:
             evidence = CanonicalConnectorActionAdapter._write_once_evidenced(
-                adapter, self._decode_snapshot(action_canonical)
+                adapter,
+                self._decode_snapshot(action_canonical),
+                attempt_fingerprint=fingerprint,
             )
         except Exception:
             evidence = None
         try:
             from new_system_connector_action_adapter import _AdapterWrite
             attempted = type(evidence) is _AdapterWrite and evidence._attempted is True
+            entry = evidence._entry if type(evidence) is _AdapterWrite else "unknown"
             outcome = evidence._outcome if type(evidence) is _AdapterWrite else "unknown"
         except Exception:
-            attempted, outcome = False, "unknown"
+            attempted, entry, outcome = False, "unknown", "unknown"
+        if entry == "unknown":
+            if not advance("entry-unknown"):
+                return result("journal-failed", True, True, False, "write", "unknown")
+            return result("outcome-unknown", True, True, False, "write", "unknown")
         if not attempted:
-            return stop("write-not-attempted", read=True, phase="authorize")
+            if not advance("not-invoked"):
+                return result("journal-failed", True, True, False, "write")
+            return result("not-invoked", True, True, False, "write", "not-attempted")
         if not advance("write-started"):
             return result("journal-failed", True, True, True, "write", "unknown")
         if type(outcome) is not str:

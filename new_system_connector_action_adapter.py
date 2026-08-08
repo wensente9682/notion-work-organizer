@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import threading
 from collections.abc import Mapping
@@ -10,6 +11,11 @@ from types import FunctionType, MappingProxyType
 
 from new_system_write_coordinator import ReadFailure
 from new_system_approval import PreviewInputError, canonical_action_bytes
+from new_system_connector_entry_bridge import (
+    ConnectorEntryBridge,
+    ConnectorEntryOutcome,
+    ConnectorEntryWireBridge,
+)
 
 
 _MAX_DEPTH = 4
@@ -93,16 +99,18 @@ class _AdapterRead(Mapping):
 
 
 class _AdapterWrite:
-    __slots__ = ("_attempted", "_outcome")
+    __slots__ = ("_attempted", "_outcome", "_entry")
 
-    def __init__(self, attempted: bool, outcome: str):
+    def __init__(self, attempted: bool, outcome: str, entry: str | None = None):
         self._attempted = attempted
         self._outcome = outcome
+        self._entry = entry or ("invoked" if attempted else "not-invoked")
 
     def to_public_dict(self) -> dict[str, object]:
         return {
             "status": "write-result",
             "connector_write_attempted": self._attempted,
+            "connector_entry": self._entry,
             "outcome": self._outcome,
         }
 
@@ -235,6 +243,21 @@ def _connector_method(connector: object, name: str) -> FunctionType | None:
     return None
 
 
+def _connector_write_signature(method: object) -> bool:
+    if type(method) is not FunctionType:
+        return False
+    try:
+        code = method.__code__
+        forbidden = inspect.CO_VARARGS | inspect.CO_VARKEYWORDS | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+        return (
+            code.co_argcount == 2
+            and code.co_kwonlyargcount == 0
+            and not (code.co_flags & forbidden)
+        )
+    except BaseException:
+        return False
+
+
 class CanonicalConnectorActionAdapter:
     """A small local adapter; its connector is a synthetic test double only."""
 
@@ -297,7 +320,12 @@ class CanonicalConnectorActionAdapter:
     def write_once(self, action: object):
         return self._write_once_evidenced(action)._outcome
 
-    def _write_once_evidenced(self, action: object) -> _AdapterWrite:
+    def _write_once_evidenced(
+        self,
+        action: object,
+        *,
+        attempt_fingerprint: object = "0" * 32,
+    ) -> _AdapterWrite:
         with self._lock:
             checked = _action(action)
             if checked is None:
@@ -316,17 +344,52 @@ class CanonicalConnectorActionAdapter:
             self._write_used = True
             self._write_inflight = True
         method = _connector_method(self._connector, "write_canonical")
-        if method is None:
+        wire = type(self._connector) is ConnectorEntryWireBridge
+        if method is None and not wire:
             with self._lock:
                 self._write_inflight = False
             return _AdapterWrite(False, "unknown")
+        if not wire and not _connector_write_signature(method):
+            with self._lock:
+                self._write_inflight = False
+            return _AdapterWrite(False, "not-invoked")
+        bridge = None
         try:
-            outcome = method(self._connector, request)
+            if wire:
+                evidence = ConnectorEntryWireBridge.execute(
+                    self._connector, request, digest, attempt_fingerprint
+                )
+            else:
+                bridge = ConnectorEntryBridge(digest, attempt_fingerprint)
+                handoff = bridge.handoff(digest, attempt_fingerprint)
+                acknowledgement = bridge.acknowledge(handoff)
+                evidence = bridge.invoke(
+                    acknowledgement,
+                    lambda supplied: method(self._connector, supplied),
+                    request,
+                )
+            attempted = type(evidence) is ConnectorEntryOutcome and evidence._attempted is True
+            outcome = evidence._outcome if type(evidence) is ConnectorEntryOutcome else "unknown"
+            entry = evidence._entry if type(evidence) is ConnectorEntryOutcome else "unknown"
         except BaseException:
-            outcome = "unknown"
+            try:
+                evidence = (
+                    bridge.close() if type(bridge) is ConnectorEntryBridge
+                    else ConnectorEntryWireBridge.close(self._connector) if wire
+                    else None
+                )
+            except BaseException:
+                evidence = None
+            attempted = type(evidence) is ConnectorEntryOutcome and evidence._attempted is True
+            outcome = "unknown" if attempted else "not-invoked"
+            entry = "invoked" if attempted else "not-invoked"
         with self._lock:
             self._write_inflight = False
             if self._authority_revoked:
-                return _AdapterWrite(True, "unknown")
+                return _AdapterWrite(attempted, "unknown" if attempted else "not-invoked", entry)
+        if entry == "unknown":
+            return _AdapterWrite(False, "unknown", "unknown")
+        if not attempted:
+            return _AdapterWrite(False, "not-invoked")
         closed = outcome if type(outcome) is str and outcome in {"success", "changed", "no-op", "partial", "ambiguous"} else "unknown"
         return _AdapterWrite(True, closed)

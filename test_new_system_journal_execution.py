@@ -16,6 +16,7 @@ from unittest import mock
 
 from new_system_approval import ApprovalEnvelope, ApprovalLedger, preview_next_action
 from new_system_connector_action_adapter import CanonicalConnectorActionAdapter
+from new_system_connector_entry_bridge import ConnectorEntryWireBridge
 from new_system_recovery_journal import RecoveryJournal
 from new_system_write_coordinator import WriteCoordinator
 
@@ -336,7 +337,7 @@ class T9RedGate(unittest.TestCase):
         leaf = self.root / "adapter-pre-io-revoked" / ".todo_archive" / "new_system_recovery.json"
         durable = json.loads(leaf.read_text())
         self.assertEqual(
-            ("interrupted", True, False, False),
+            ("not-invoked", True, False, False),
             tuple(
                 durable[key]
                 for key in (
@@ -348,7 +349,7 @@ class T9RedGate(unittest.TestCase):
             ),
         )
         resumed = RecoveryJournal(self.root / "adapter-pre-io-revoked").resume_review().to_public_dict()
-        self.assertEqual("fresh-reinspection", resumed["classification"])
+        self.assertEqual("not-invoked", resumed["classification"])
         self.assertFalse(resumed["write_authority"])
 
     def test_trusted_adapter_attempt_evidence_drives_durable_write_facts(self):
@@ -367,6 +368,81 @@ class T9RedGate(unittest.TestCase):
                 self.assertEqual(terminal, durable["phase"])
                 self.assertTrue(durable["write_attempted"])
                 self.assertTrue(durable["write_started"])
+
+    def test_missing_connector_write_entry_is_not_invoked_and_never_uncertain(self):
+        class ReadOnlyConnector:
+            def __init__(self): self.read_calls = 0
+            def read_canonical(self, _request):
+                self.read_calls += 1
+                return state()
+
+        ledger = ApprovalLedger()
+        envelope = ledger.issue(ledger.preview(action(), state()), accepted=True)
+        connector = ReadOnlyConnector()
+        root = self.root / "not-invoked"
+        result = WriteCoordinator(ledger).run(
+            envelope,
+            action(),
+            state(),
+            CanonicalConnectorActionAdapter(connector),
+            recovery_journal=RecoveryJournal(root),
+        )
+        self.assertEqual("not-invoked", result.reason)
+        self.assertTrue(result.approval_consumed)
+        self.assertFalse(result.write_attempted)
+        self.assertEqual("not-attempted", result.outcome_certainty)
+        durable = json.loads(
+            (root / ".todo_archive" / "new_system_recovery.json").read_text()
+        )
+        self.assertEqual(
+            ("not-invoked", False, False),
+            (durable["phase"], durable["write_attempted"], durable["write_started"]),
+        )
+        self.assertNotIn(durable["phase"], {"outcome-unknown", "possible-partial"})
+        resumed = RecoveryJournal(root).resume_review().to_public_dict()
+        self.assertEqual("not-invoked", resumed["classification"])
+        self.assertFalse(resumed["write_authority"])
+
+    def test_signature_failure_is_not_invoked_but_body_exception_is_attempted(self):
+        class BadSignature(Connector):
+            def write_canonical(self):
+                raise AssertionError("must not enter")
+        class BodyTypeError(Connector):
+            def write_canonical(self, _request):
+                self.write_calls += 1
+                raise TypeError("inside body")
+        for index, (connector, expected_phase, attempted) in enumerate((
+            (BadSignature(), "not-invoked", False),
+            (BodyTypeError(), "outcome-unknown", True),
+        )):
+            with self.subTest(phase=expected_phase):
+                ledger = ApprovalLedger(); envelope = ledger.issue(ledger.preview(action(), state()), accepted=True)
+                root = self.root / ("signature-" + str(index))
+                result = WriteCoordinator(ledger).run(
+                    envelope, action(), state(), CanonicalConnectorActionAdapter(connector),
+                    recovery_journal=RecoveryJournal(root),
+                )
+                durable = json.loads((root / ".todo_archive" / "new_system_recovery.json").read_text())
+                self.assertEqual(expected_phase, durable["phase"])
+                self.assertEqual(attempted, durable["write_attempted"])
+                self.assertEqual(int(attempted), connector.write_calls)
+                self.assertNotEqual("completed", result.status)
+
+    def test_wire_bridge_entry_evidence_drives_not_invoked_unknown_and_attempted_facts(self):
+        ledger = ApprovalLedger(); preview = ledger.preview(action(), state())
+        envelope = ledger.issue(preview, accepted=True)
+        transcript = io.BytesIO(b'{"type":"connector-outcome","outcome":"success"}\n')
+        root = self.root / "wire-unsupported"
+        bridge = ConnectorEntryWireBridge(transcript, io.BytesIO(), state())
+        result = WriteCoordinator(ledger).run(
+            envelope, action(), state(), CanonicalConnectorActionAdapter(bridge),
+            recovery_journal=RecoveryJournal(root),
+        )
+        durable = json.loads((root / ".todo_archive" / "new_system_recovery.json").read_text())
+        self.assertEqual("entry-unknown", durable["phase"])
+        self.assertFalse(durable["write_attempted"])
+        self.assertEqual("unknown", result.outcome_certainty)
+        self.assertNotEqual("completed", result.status)
 
     def test_dynamic_or_noncanonical_adapter_cannot_forge_attempt_evidence(self):
         class DynamicOutcome:

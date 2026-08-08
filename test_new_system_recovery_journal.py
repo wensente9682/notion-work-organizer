@@ -33,7 +33,7 @@ def facts(**changes):
 def facts_for(event, interrupted_from=None, **changes):
     """Independent frozen-state oracle; it does not mirror implementation code."""
     values = facts()
-    if event in {"read-completed", "write-ready", "write-started", "confirmed-applied",
+    if event in {"read-completed", "write-ready", "not-invoked", "entry-unknown", "write-started", "confirmed-applied",
                  "confirmed-not-applied", "outcome-unknown", "possible-partial", "consumed"}:
         values["read_attempted"] = True
     if event in {"write-started", "confirmed-applied", "confirmed-not-applied",
@@ -93,6 +93,134 @@ class RecoveryJournalRedGate(unittest.TestCase):
         self.root = Path(self.tmp.name)
     def tearDown(self): self.tmp.cleanup()
 
+    def outcome_unknown_journal(self, root=None):
+        subject = journal(self.root if root is None else root)
+        for phase in ("prepared", "read-completed", "write-ready", "write-started", "outcome-unknown"):
+            subject.transition(phase, facts_for(phase))
+        return subject
+
+    def correction_authority(self, subject, calls=0):
+        from new_system_recovery_journal import NotInvokedCorrectionAuthority
+        authority = NotInvokedCorrectionAuthority()
+        preview = authority.review(subject, connector_calls=calls)
+        capability = authority.authorize(preview)
+        return authority, preview, capability
+
+    def test_audited_zero_io_correction_preserves_original_and_is_review_only(self):
+        subject = self.outcome_unknown_journal()
+        original_path = self.root / ".todo_archive" / "new_system_recovery.json"
+        original = original_path.read_bytes()
+        authority, _, capability = self.correction_authority(subject)
+        corrected = subject.correct_not_invoked(authority, capability).to_public_dict()
+        self.assertEqual("corrected", corrected["status"])
+        self.assertEqual("audited-not-invoked", corrected["phase"])
+        self.assertEqual(original, original_path.read_bytes())
+        audit = json.loads(
+            (self.root / ".todo_archive" / "new_system_recovery_correction.json").read_text()
+        )
+        self.assertEqual(("outcome-unknown", True, False, "not-invoked", 1), (
+            audit["original_phase"], audit["original_write_attempted"],
+            audit["corrected_write_attempted"], audit["outcome"], audit["sequence"],
+        ))
+        review = journal(self.root).resume_review().to_public_dict()
+        self.assertEqual("not-invoked", review["classification"])
+        self.assertEqual("audited-not-invoked", review["phase"])
+        self.assertFalse(review["write_authority"])
+
+    def test_correction_is_single_use_and_rejects_wrong_record_or_nonzero_io(self):
+        subject = self.outcome_unknown_journal(self.root / "nonzero")
+        authority, preview, capability = self.correction_authority(subject, calls=1)
+        self.assertIsNone(preview); self.assertIsNone(capability)
+        self.assertEqual("rejected", subject.correct_not_invoked(authority, capability).to_public_dict()["status"])
+
+        root = self.root / "cross-instance"; subject = self.outcome_unknown_journal(root)
+        authority, _, capability = self.correction_authority(subject)
+        self.assertEqual("rejected", journal(root).correct_not_invoked(authority, capability).to_public_dict()["status"])
+
+        subject = self.outcome_unknown_journal(self.root / "duplicate")
+        authority, _, capability = self.correction_authority(subject)
+        self.assertEqual("corrected", subject.correct_not_invoked(authority, capability).to_public_dict()["status"])
+        self.assertEqual("rejected", subject.correct_not_invoked(authority, capability).to_public_dict()["status"])
+
+    def test_correction_rejects_dynamic_malformed_and_wrong_original_phase(self):
+        from new_system_recovery_journal import NotInvokedCorrectionAuthority
+        for index, value in enumerate((None, {}, DynamicTrap([]), object())):
+            with self.subTest(index=index):
+                root = self.root / ("bad-" + str(index))
+                subject = self.outcome_unknown_journal(root)
+                self.assertEqual("rejected", subject.correct_not_invoked(value, value).to_public_dict()["status"])
+        root = self.root / "wrong-phase"; subject = journal(root)
+        subject.transition("prepared", facts_for("prepared"))
+        authority = NotInvokedCorrectionAuthority()
+        self.assertIsNone(authority.review(subject, connector_calls=0))
+        with self.assertRaises(TypeError): copy.copy(authority)
+        valid = self.outcome_unknown_journal(self.root / "opaque")
+        authority, preview, capability = self.correction_authority(valid)
+        with self.assertRaises(TypeError): copy.copy(preview)
+        with self.assertRaises(TypeError): copy.copy(capability)
+
+    def test_correction_is_atomic_under_failure_and_never_changes_original(self):
+        subject = self.outcome_unknown_journal(); original_path = self.root / ".todo_archive" / "new_system_recovery.json"
+        original = original_path.read_bytes()
+        authority, _, capability = self.correction_authority(subject)
+        with mock.patch("new_system_recovery_journal.os.replace", side_effect=OSError("synthetic")):
+            result = subject.correct_not_invoked(authority, capability).to_public_dict()
+        self.assertEqual("rejected", result["status"])
+        self.assertEqual(original, original_path.read_bytes())
+        review = journal(self.root).resume_review().to_public_dict()
+        self.assertEqual("fresh-review-required", review["status"])
+        self.assertFalse(review["write_authority"])
+
+    def test_concurrent_correction_has_exactly_one_accepted_audit_event(self):
+        subject = self.outcome_unknown_journal(); authority, _, capability = self.correction_authority(subject)
+        barrier = threading.Barrier(3); results = []
+        def worker():
+            barrier.wait()
+            results.append(subject.correct_not_invoked(authority, capability).to_public_dict()["status"])
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for item in threads: item.start()
+        barrier.wait()
+        for item in threads: item.join(1)
+        self.assertEqual(1, results.count("corrected"))
+        self.assertEqual(1, sum(status in {"rejected", "lock-conflicted"} for status in results))
+
+    def test_correct_review_then_archive_clear_preserves_audit_and_opens_active_gate(self):
+        subject = self.outcome_unknown_journal(); authority, _, capability = self.correction_authority(subject)
+        self.assertEqual("corrected", subject.correct_not_invoked(authority, capability).to_public_dict()["status"])
+        self.assertEqual("rejected", subject.clear_terminal().to_public_dict()["status"])
+        self.assertTrue(subject.resume_review().to_public_dict()["review_generated"])
+        cleared = subject.clear_terminal().to_public_dict()
+        self.assertEqual("archived-cleared", cleared["status"])
+        todo = self.root / ".todo_archive"
+        self.assertFalse((todo / "new_system_recovery.json").exists())
+        self.assertFalse((todo / "new_system_recovery_correction.json").exists())
+        self.assertFalse((todo / "new_system_recovery_correction_review.json").exists())
+        archive = json.loads((todo / "new_system_recovery_archive.json").read_text())
+        self.assertEqual("outcome-unknown", json.loads(archive["original_snapshot_json"])["phase"])
+        self.assertEqual("audited-not-invoked", json.loads(archive["correction_snapshot_json"])["status"])
+        self.assertEqual("audited-not-invoked-reviewed", json.loads(archive["review_snapshot_json"])["status"])
+        self.assertEqual("fresh-review-required", journal(self.root).resume_review().to_public_dict()["status"])
+        self.assertEqual("rejected", subject.clear_terminal().to_public_dict()["status"])
+
+    def test_corrected_archive_clear_failure_preserves_archive_and_blocks(self):
+        subject = self.outcome_unknown_journal(); authority, _, capability = self.correction_authority(subject)
+        subject.correct_not_invoked(authority, capability); subject.resume_review()
+        todo = self.root / ".todo_archive"; correction_path = todo / "new_system_recovery_correction.json"
+        real_unlink = os.unlink
+        def fail_correction(path, *args, **kwargs):
+            if Path(path) == correction_path: raise OSError("synthetic")
+            return real_unlink(path, *args, **kwargs)
+        with mock.patch("new_system_recovery_journal.os.unlink", side_effect=fail_correction):
+            result = subject.clear_terminal().to_public_dict()
+        self.assertEqual("rejected", result["status"])
+        archive_path = todo / "new_system_recovery_archive.json"
+        self.assertTrue(archive_path.exists())
+        archive = json.loads(archive_path.read_text())
+        self.assertEqual("outcome-unknown", json.loads(archive["original_snapshot_json"])["phase"])
+        review = journal(self.root).resume_review().to_public_dict()
+        self.assertEqual("fresh-review-required", review["status"])
+        self.assertFalse(review["write_authority"])
+
     def test_no_record_all_entries_have_no_authority(self):
         subject = journal(self.root)
         self.assertEqual("fresh-review-required", subject.resume_review().to_public_dict()["status"])
@@ -106,6 +234,29 @@ class RecoveryJournalRedGate(unittest.TestCase):
         rejected = subject.transition("write-started", facts_for("write-started")).to_public_dict()
         self.assertEqual("rejected", rejected["status"])
         self.assertFalse(rejected["write_authority"])
+
+    def test_not_invoked_is_a_closed_write_ready_fact_with_zero_write_flags(self):
+        subject = journal(self.root)
+        for phase in ("prepared", "read-completed", "write-ready", "not-invoked"):
+            result = subject.transition(phase, facts_for(phase)).to_public_dict()
+            self.assertEqual("accepted", result["status"])
+        durable = json.loads(
+            (self.root / ".todo_archive" / "new_system_recovery.json").read_text()
+        )
+        self.assertEqual(("not-invoked", False, False), (
+            durable["phase"], durable["write_attempted"], durable["write_started"]
+        ))
+        review = journal(self.root).resume_review().to_public_dict()
+        self.assertEqual("not-invoked", review["classification"])
+        self.assertFalse(review["write_authority"])
+
+        uncertain_root = self.root / "entry-unknown"
+        uncertain = journal(uncertain_root)
+        for phase in ("prepared", "read-completed", "write-ready", "entry-unknown"):
+            self.assertEqual("accepted", uncertain.transition(phase, facts_for(phase)).to_public_dict()["status"])
+        uncertain_review = journal(uncertain_root).resume_review().to_public_dict()
+        self.assertEqual("possible-partial", uncertain_review["classification"])
+        self.assertFalse(uncertain_review["write_authority"])
 
     def test_frozen_graph_each_source_has_legal_and_illegal_symmetric_events(self):
         paths = (
