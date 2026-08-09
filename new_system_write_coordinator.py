@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from functools import wraps
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -14,6 +16,115 @@ from new_system_approval import (
     preview_next_action,
 )
 from new_system_recovery_journal import RecoveryJournal
+
+
+def _build_source_channel():
+    """Keep source-create execution provenance inside one coordinator closure."""
+    lock = threading.Lock()
+    registry: dict[object, bytes] = {}
+    consumed: set[object] = set()
+
+    class SourceExecution:
+        __slots__ = ("__token",)
+
+        def __init__(self, token: object):
+            object.__setattr__(self, "_SourceExecution__token", token)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            raise AttributeError("immutable opaque execution")
+
+        def __copy__(self):
+            raise TypeError("opaque execution is not copyable")
+
+        def __deepcopy__(self, memo):
+            raise TypeError("opaque execution is not copyable")
+
+        def __reduce_ex__(self, protocol):
+            raise TypeError("opaque execution is not serializable")
+
+    def mint(payload: object) -> object:
+        try:
+            snapshot = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError):
+            snapshot = b""
+        execution = SourceExecution(object())
+        with lock:
+            registry[execution] = snapshot
+        return execution
+
+    def consume(execution: object, expected_digest: object) -> tuple[object, ...] | None:
+        with lock:
+            if type(execution) is not SourceExecution:
+                return None
+            snapshot = registry.get(execution)
+            if snapshot is None or execution in consumed:
+                return None
+            try:
+                payload = json.loads(snapshot)
+            except (TypeError, ValueError, UnicodeError):
+                return None
+            if type(payload) is not dict or payload.get("action_digest") != expected_digest:
+                return None
+            status = payload.get("status")
+            certainty = payload.get("outcome_certainty")
+            reason = payload.get("reason")
+            attempt = payload.get("attempt_fingerprint")
+            if type(attempt) is not str or not attempt:
+                return None
+            if status == "completed" and certainty == "confirmed" and reason == "completed":
+                response = payload.get("response")
+                if type(response) is not dict or set(response) != {"status", "database_id", "data_source_id"} or response.get("status") != "success":
+                    claim = ("unresolved",)
+                else:
+                    database_id, data_source_id = response.get("database_id"), response.get("data_source_id")
+                    invalid = {"TODO", "TBD", "UNKNOWN", "?"}
+                    if (
+                        type(database_id) is not str or type(data_source_id) is not str
+                        or not database_id or not data_source_id
+                        or database_id != database_id.strip() or data_source_id != data_source_id.strip()
+                        or database_id.upper() in invalid or data_source_id.upper() in invalid
+                        or database_id == data_source_id
+                    ):
+                        claim = ("unresolved",)
+                    else:
+                        claim = ("source-created", database_id, data_source_id)
+            elif reason == "write-not-applied" and certainty == "not-applied":
+                claim = ("write-failed",)
+            else:
+                claim = ("unresolved",)
+            consumed.add(execution)
+            return claim
+
+    def bind(run_method):
+        @wraps(run_method)
+        def bound(self, *args, **kwargs):
+            result = run_method(self, *args, _source_mint=mint, **kwargs)
+            action = args[1] if len(args) > 1 else kwargs.get("action")
+            source_create = (
+                type(action) is dict
+                and action.get("kind") == "create_database"
+                and type(action.get("payload")) is dict
+                and set(action["payload"]) == {"request"}
+            )
+            if source_create and type(result) is WriteResult:
+                return mint({
+                    "action_digest": result.action_digest,
+                    "attempt_fingerprint": result.attempt_fingerprint,
+                    "status": result.status,
+                    "outcome_certainty": result.outcome_certainty,
+                    "reason": result.reason,
+                    "response": None,
+                })
+            return result
+        return bound
+
+    return bind, consume
+
+
+_bind_source_run, consume_source_execution = _build_source_channel()
+del _build_source_channel
 
 
 @dataclass(frozen=True)
@@ -174,6 +285,7 @@ class WriteCoordinator:
         interrupt_before_read: bool = False,
         interrupt_after_read: bool = False,
         recovery_journal: object | None = None,
+        _source_mint=None,
     ) -> WriteResult:
         if recovery_journal is not None:
             return self._run_journal(
@@ -192,6 +304,19 @@ class WriteCoordinator:
         phase = "claim"
         read_attempted = False
         write_attempted = False
+        source_create = type(action) is dict and action.get("kind") == "create_database" and type(action.get("payload")) is dict and set(action["payload"]) == {"request"}
+
+        def source_terminal(result, response=None):
+            if not source_create:
+                return result
+            return _source_mint({
+                "action_digest": action_digest,
+                "attempt_fingerprint": fingerprint,
+                "status": result.status,
+                "outcome_certainty": result.outcome_certainty,
+                "reason": result.reason,
+                "response": response,
+            })
 
         def recovery(
             reason: str,
@@ -208,7 +333,7 @@ class WriteCoordinator:
                 consumed = decision.code != "approval.unknown"
             except Exception:
                 consumed = False
-            return self._recovery(
+            return source_terminal(self._recovery(
                 reason,
                 approval_consumed=consumed,
                 read_attempted=read_attempted,
@@ -217,7 +342,7 @@ class WriteCoordinator:
                 action_digest=action_digest,
                 attempt_fingerprint=fingerprint,
                 phase=phase,
-            )
+            ))
 
         try:
             if (
@@ -276,7 +401,7 @@ class WriteCoordinator:
                 claim, self._decode_snapshot(action_canonical), observed
             )
             if not decision.authorized:
-                return self._recovery(
+                return source_terminal(self._recovery(
                     "drift" if decision.code == "approval.binding-mismatch" else "approval-denied",
                     approval_consumed=True,
                     read_attempted=read_attempted,
@@ -285,7 +410,7 @@ class WriteCoordinator:
                     action_digest=action_digest,
                     attempt_fingerprint=fingerprint,
                     phase=phase,
-                )
+                ))
             phase = "write"
             write_attempted = True
             try:
@@ -296,14 +421,19 @@ class WriteCoordinator:
                     expected_state_canonical,
                 ):
                     return recovery("authority-drift", interrupted=True)
-                outcome = adapter.write_once(self._decode_snapshot(action_canonical))
+                evidence = None
+                if hasattr(adapter, "_write_once_evidenced"):
+                    evidence = adapter._write_once_evidenced(self._decode_snapshot(action_canonical), attempt_fingerprint=fingerprint)
+                    outcome = evidence._outcome
+                else:
+                    outcome = adapter.write_once(self._decode_snapshot(action_canonical))
             except Exception:
                 outcome = None
             if type(outcome) is not str:
                 outcome = "unknown"
             if outcome == "success":
                 phase = "completed"
-                return WriteResult(
+                result = WriteResult(
                     "completed",
                     "completed",
                     True,
@@ -318,8 +448,9 @@ class WriteCoordinator:
                     phase,
                     None,
                 )
+                return source_terminal(result, evidence._source if evidence is not None else None)
             if outcome == "changed" or outcome == "no-op":
-                return self._recovery(
+                return source_terminal(self._recovery(
                     "write-not-applied",
                     approval_consumed=True,
                     read_attempted=read_attempted,
@@ -328,9 +459,9 @@ class WriteCoordinator:
                     action_digest=action_digest,
                     attempt_fingerprint=fingerprint,
                     phase=phase,
-                )
+                ))
             if outcome == "partial":
-                return self._recovery(
+                return source_terminal(self._recovery(
                     "possible-partial",
                     approval_consumed=True,
                     read_attempted=read_attempted,
@@ -339,8 +470,8 @@ class WriteCoordinator:
                     action_digest=action_digest,
                     attempt_fingerprint=fingerprint,
                     phase=phase,
-                )
-            return self._recovery(
+                ))
+            return source_terminal(self._recovery(
                 "outcome-unknown",
                 approval_consumed=True,
                 read_attempted=read_attempted,
@@ -349,7 +480,7 @@ class WriteCoordinator:
                 action_digest=action_digest,
                 attempt_fingerprint=fingerprint,
                 phase=phase,
-            )
+            ))
         except Exception:
             return recovery("internal-failure", interrupted=True)
 
@@ -511,3 +642,7 @@ class WriteCoordinator:
         if terminal[1] != "completed":
             return result(terminal[1], True, True, True, "write", terminal[2])
         return WriteResult("completed", "completed", True, True, True, True, "confirmed", False, False, None, None, "completed", None)
+
+
+WriteCoordinator.run = _bind_source_run(WriteCoordinator.run)
+del _bind_source_run

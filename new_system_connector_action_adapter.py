@@ -99,12 +99,13 @@ class _AdapterRead(Mapping):
 
 
 class _AdapterWrite:
-    __slots__ = ("_attempted", "_outcome", "_entry")
+    __slots__ = ("_attempted", "_outcome", "_entry", "_source")
 
-    def __init__(self, attempted: bool, outcome: str, entry: str | None = None):
+    def __init__(self, attempted: bool, outcome: str, entry: str | None = None, source: object = None):
         self._attempted = attempted
         self._outcome = outcome
         self._entry = entry or ("invoked" if attempted else "not-invoked")
+        self._source = source
 
     def to_public_dict(self) -> dict[str, object]:
         return {
@@ -178,6 +179,19 @@ def _action(action: object):
     kind = dict.get(action, "kind") if type(action) is dict else None
     if type(action) is dict and type(kind) is not str:
         return None
+    if kind == "create_database" and type(action) is dict and set(action) == {"kind", "target", "payload"}:
+        target, payload = action["target"], action["payload"]
+        request = payload.get("request") if type(payload) is dict else None
+        if (type(target) is dict and set(target) == {"page_id"} and type(target["page_id"]) is str
+                and type(request) is dict and set(request) == {"parent", "title", "schema"}
+                and request.get("parent") == target and request.get("title") == "Daily Work"
+                and type(request.get("schema")) is str and request["schema"].startswith('CREATE TABLE ("Task" TITLE, "Done" CHECKBOX, "Category" SELECT(')
+                and request["schema"].endswith(', "Time Blocks" RICH_TEXT)')):
+            try:
+                canonical = canonical_action_bytes(action)
+            except (PreviewInputError, TypeError, ValueError, OverflowError):
+                return None
+            return hashlib.sha256(canonical).hexdigest(), json.loads(canonical)
     if kind == "create_archive_target":
         try:
             canonical = canonical_action_bytes(action)
@@ -227,6 +241,8 @@ def _action(action: object):
 
 
 def _connector_request(action: dict[str, object]) -> dict[str, object]:
+    if action["kind"] == "create_database" and set(action.get("payload", {})) == {"request"}:
+        return action["payload"]["request"]
     if action["kind"] != "create_archive_target":
         return action
     return action["connector_projection"]["request"]
@@ -354,6 +370,7 @@ class CanonicalConnectorActionAdapter:
                 self._write_inflight = False
             return _AdapterWrite(False, "not-invoked")
         bridge = None
+        source = None
         try:
             if wire:
                 evidence = ConnectorEntryWireBridge.execute(
@@ -363,9 +380,14 @@ class CanonicalConnectorActionAdapter:
                 bridge = ConnectorEntryBridge(digest, attempt_fingerprint)
                 handoff = bridge.handoff(digest, attempt_fingerprint)
                 acknowledgement = bridge.acknowledge(handoff)
+                def call(supplied):
+                    nonlocal source
+                    value = method(self._connector, supplied)
+                    source = value if type(value) is dict else None
+                    return value.get("status") if type(value) is dict else value
                 evidence = bridge.invoke(
                     acknowledgement,
-                    lambda supplied: method(self._connector, supplied),
+                    call,
                     request,
                 )
             attempted = type(evidence) is ConnectorEntryOutcome and evidence._attempted is True
@@ -392,4 +414,4 @@ class CanonicalConnectorActionAdapter:
         if not attempted:
             return _AdapterWrite(False, "not-invoked")
         closed = outcome if type(outcome) is str and outcome in {"success", "changed", "no-op", "partial", "ambiguous"} else "unknown"
-        return _AdapterWrite(True, closed)
+        return _AdapterWrite(True, closed, source=source if action_value.get("kind") == "create_database" else None)

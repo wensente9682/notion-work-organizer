@@ -317,6 +317,41 @@ class RecoveryJournal:
         if before.st_ino != after.st_ino: raise _IdentityDrift
     def transition(self, event, facts):
         return self._safe(lambda: self._transition(event, facts))
+
+    def consume_source_dispatch(self, action_digest, attempt_fingerprint, terminal):
+        """Atomically close one journal-bound source-create dispatch result."""
+        return self._safe(lambda: self._consume_source_dispatch(
+            action_digest, attempt_fingerprint, terminal
+        ))
+
+    def _consume_source_dispatch(self, action_digest, attempt_fingerprint, terminal):
+        fd = self._claim()
+        if fd == "locked": return self._result("lock-conflicted", failure="lock-conflicted")
+        if fd is None: return self._result("rejected", failure="state-invalid")
+        try:
+            try: data, _ = self._read()
+            except ValueError: return self._result("rejected", failure="corrupt")
+            if (
+                self._revoked or getattr(self._active, "dirty", False)
+                or self._has_incomplete_publication() or self._has_sentinel()
+                or type(action_digest) is not str or type(attempt_fingerprint) is not str
+                or terminal not in {"confirmed-applied", "confirmed-not-applied", "outcome-unknown", "possible-partial"}
+                or not data or data["phase"] != "write-ready"
+                or data["action_digest"] != action_digest
+                or data["attempt_fingerprint"] != attempt_fingerprint
+            ):
+                return self._result("rejected", failure="state-invalid")
+            record = dict(data)
+            record.update({
+                "phase": terminal,
+                "write_attempted": True,
+                "write_started": True,
+                "review_generated": False,
+            })
+            self._lifecycle(fd, lambda: self._write(record))
+            return self._result("accepted", terminal)
+        finally: self._release(fd)
+
     def _transition(self, event, facts):
         fd = self._claim()
         if fd == "locked": return self._result("lock-conflicted", failure="lock-conflicted")
