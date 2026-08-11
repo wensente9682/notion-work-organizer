@@ -45,6 +45,14 @@ class FinalizationReport:
 
 
 @dataclass(frozen=True)
+class ProfileGenerationResult:
+    """A validated, unpublished private-profile payload."""
+
+    status: str
+    content: bytes | None
+
+
+@dataclass(frozen=True)
 class _ExpectedProfile:
     root: tuple[int, ...]
     parent: tuple[int, ...]
@@ -68,6 +76,25 @@ class NewSystemFinalizer:
     @staticmethod
     def _fail_report(phase: str, operation_id: str, reads: int) -> FinalizationReport:
         return FinalizationReport("not-ready", phase, operation_id, 4)
+
+    def generate_profile(self, snapshot: object) -> ProfileGenerationResult:
+        """Generate a canonical profile without publishing it or running product features."""
+        materialized = _materialize(snapshot)
+        if (
+            materialized is None
+            or validate_canonical_blueprint(materialized).status != "ready"
+        ):
+            return ProfileGenerationResult("not-ready", None)
+        content = self._profile_content(materialized)
+        if content is None:
+            return ProfileGenerationResult("not-ready", None)
+        try:
+            profile = json.loads(content)
+        except (TypeError, ValueError, UnicodeError):
+            return ProfileGenerationResult("not-ready", None)
+        if type(profile) is not dict or profile.get("mode") != "new-system-v0.3":
+            return ProfileGenerationResult("not-ready", None)
+        return ProfileGenerationResult("ready", content)
 
     def finalize(self, snapshot_reader: object, total_api: object, organize_reader: object) -> FinalizationReport:
         operation_id = secrets.token_hex(16)

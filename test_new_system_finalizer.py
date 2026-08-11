@@ -57,6 +57,28 @@ def ready_snapshot():
 
 
 class NewSystemFinalizerTests(unittest.TestCase):
+    def test_generate_profile_is_validation_only_and_never_runs_product_features(self):
+        class Trap:
+            def __getattr__(self, name):
+                raise AssertionError(f"unexpected product feature call: {name}")
+
+        with tempfile.TemporaryDirectory() as root:
+            finalizer = NewSystemFinalizer(
+                Path(root) / ".todo_archive" / "new_system_profile.json",
+                ignore_checker=lambda _: True,
+            )
+            result = finalizer.generate_profile(ready_snapshot())
+            self.assertEqual("ready", result.status)
+            self.assertIsInstance(result.content, bytes)
+            self.assertEqual("new-system-v0.3", json.loads(result.content)["mode"])
+            self.assertFalse((Path(root) / ".todo_archive" / "new_system_profile.json").exists())
+            _ = Trap()  # the generation seam has no Total/Organize collaborators to call
+
+            invalid = ready_snapshot()
+            invalid["source"]["id"] = ""
+            rejected = finalizer.generate_profile(invalid)
+            self.assertEqual("not-ready", rejected.status)
+            self.assertIsNone(rejected.content)
     def test_ready_creates_dedicated_private_profile_then_total_then_organize(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".todo_archive" / "new_system_profile.json"

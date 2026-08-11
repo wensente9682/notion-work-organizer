@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import json
 import pickle
 import subprocess
@@ -11,15 +12,177 @@ from unittest import mock
 from new_system_approval import ApprovalLedger
 from new_system_connector_action_adapter import CanonicalConnectorActionAdapter
 from new_system_onboarding import (
-    begin, expected_state, ingest_execution, ingest_source_dispatch,
-    ingest_journal_source_dispatch, next_action, prepare_journal_source_dispatch,
+    begin, from_verified_source, expected_state, ingest_execution, ingest_source_dispatch,
+    ingest_journal_archive_dispatch, ingest_journal_source_dispatch, next_action, prepare_journal_archive_dispatch, prepare_journal_source_dispatch,
+    profile_for, profile_is_valid,
     prepare_source_dispatch, preview, source_dispatch_request,
 )
 from new_system_recovery_journal import RecoveryJournal
 from new_system_write_coordinator import WriteCoordinator
 
 
+def _archive_result(parent, database, source, title):
+    return (
+        f'Created database: &lt;database url="{{{{https://app.notion.com/p/{database}}}}}"&gt;'
+        f'The title of this Database is: {title}. &lt;parent-page url="https://app.notion.com/p/{parent.replace("-", "")}" /&gt; '
+        f'&lt;data-source url="{{{{collection://{source}}}}}"&gt;&lt;/data-source&gt;&lt;/database&gt;'
+    )
+
+
 class NewSystemOnboardingTests(unittest.TestCase):
+    def test_verified_source_has_one_backend_owned_first_archive_action_and_english_preview(self):
+        state = from_verified_source(
+            "3b6b3d84-ad2c-8093-bb53-d7fb734df559",
+            ["Study", "Personal"],
+            "ad16f835af754222b11fda2cae3445c5",
+            "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+        )
+
+        action = next_action(state)
+
+        self.assertEqual(action, next_action(state))
+        self.assertEqual("create_archive_target", action["kind"])
+        self.assertEqual(
+            {"container": "3b6b3d84-ad2c-8093-bb53-d7fb734df559", "category": "Study"},
+            action["target"],
+        )
+        self.assertEqual(
+            {"display_name": "Study", "schema": {
+                "Task": "title", "Takeaway": "rich_text", "Improvement": "rich_text",
+            }},
+            action["payload"],
+        )
+        self.assertEqual(
+            {
+                "operation": "create_database",
+                "request": {
+                    "parent": {"page_id": "3b6b3d84-ad2c-8093-bb53-d7fb734df559"},
+                    "title": "Study",
+                    "schema": 'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, "Improvement" RICH_TEXT)',
+                },
+            },
+            action["connector_projection"],
+        )
+        self.assertEqual(
+            "Create the “Study” archive database in the confirmed dedicated page.\n"
+            "Fields: Task, Takeaway, Improvement.",
+            preview(state, action),
+        )
+
+    def test_public_entrypoints_cannot_inject_progression(self):
+        with self.assertRaises(TypeError):
+            begin("blank-page", ["Study"], phase="setup-complete")
+        with self.assertRaises(TypeError):
+            begin("blank-page", ["Study"], archives=(("Study", "db", "ds"),))
+        with self.assertRaises(ValueError):
+            from_verified_source("blank-page", ["Study"], "db", "ds")
+        from new_system_onboarding import InitialSetupState
+        state = begin("blank-page", ["Study"])
+        with self.assertRaises(TypeError): InitialSetupState("blank-page", ("Study",), "setup-complete")
+        with self.assertRaises(TypeError): dataclasses.replace(state, phase="setup-complete")
+        with self.assertRaises(TypeError): copy.copy(state)
+        with self.assertRaises(TypeError): copy.deepcopy(state)
+        with self.assertRaises(TypeError): pickle.dumps(state)
+        import new_system_onboarding
+        self.assertFalse(hasattr(new_system_onboarding, "_state"))
+
+    def test_verified_source_identities_are_globally_unique_after_uuid_normalization(self):
+        target = "3B6B3D84-AD2C-8093-BB53-D7FB734DF559"
+        source_database = "ad16f835af754222b11fda2cae3445c5"
+        source_data_source = "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce"
+        state = from_verified_source(target, ["Study"], source_database, source_data_source)
+        self.assertEqual("source-created", state.phase)
+        for duplicate_database, duplicate_source in (
+            ("3b6b3d84ad2c8093bb53d7fb734df559", source_data_source),
+            (source_database, "3B6B3D84-AD2C-8093-BB53-D7FB734DF559"),
+            ("AD16F835-AF75-4222-B11F-DA2CAE3445C5", source_database.upper()),
+        ):
+            with self.subTest(database=duplicate_database, source=duplicate_source), self.assertRaises(ValueError):
+                from_verified_source(target, ["Study"], duplicate_database, duplicate_source)
+
+    def test_archive_recheck_uses_independent_observed_literal(self):
+        state = from_verified_source(
+            "3b6b3d84-ad2c-8093-bb53-d7fb734df559", ["Study"],
+            "ad16f835af754222b11fda2cae3445c5", "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+        )
+        action = next_action(state)
+        observed = {
+            "parent": "3b6b3d84-ad2c-8093-bb53-d7fb734df559",
+            "source": {
+                "database_id": "ad16f835af754222b11fda2cae3445c5",
+                "data_source_id": "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+            },
+            "archive_count": 0,
+            "next_category": "Study",
+        }
+        self.assertEqual(observed, expected_state(state, action))
+        for actual in (observed, {**observed, "archive_count": 1}):
+            with self.subTest(actual=actual), tempfile.TemporaryDirectory() as root:
+                ledger = ApprovalLedger()
+                envelope = ledger.issue(ledger.preview(action, observed), accepted=True)
+                dispatch = prepare_journal_archive_dispatch(
+                    ledger, envelope, state, action, actual, RecoveryJournal(root),
+                )
+                self.assertEqual(actual == observed, dispatch is not None)
+    def test_source_created_plans_ordered_archives_then_stops_before_profile(self):
+        state = from_verified_source(
+            "3b6b3d84-ad2c-8093-bb53-d7fb734df559", ["Study", "Personal"],
+            "ad16f835af754222b11fda2cae3445c5", "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+        )
+        study = next_action(state)
+        self.assertEqual(("create_archive_target", "Study", "Study"), (study["kind"], study["target"]["category"], study["payload"]["display_name"]))
+        self.assertIn("Create the “Study” archive database", preview(state, study))
+        self.assertEqual(study, next_action(state))
+
+        def ingest(current, action, category, database, source):
+            expected = expected_state(current, action); ledger = ApprovalLedger()
+            envelope = ledger.issue(ledger.preview(action, expected), accepted=True)
+            with tempfile.TemporaryDirectory() as root:
+                dispatch = prepare_journal_archive_dispatch(ledger, envelope, current, action, expected, RecoveryJournal(root))
+                return ingest_journal_archive_dispatch(current, action, RecoveryJournal(root), dispatch.action_digest, dispatch.attempt_fingerprint, {
+                    "result": _archive_result(current.target_page_id, database, source, category),
+                })
+        study_done = ingest(state, study, "Study", "c" * 32, "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(("Study", "c" * 32), (study_done.archives[0][0], study_done.archives[0][1]))
+        personal = next_action(study_done)
+        self.assertEqual("Personal", personal["target"]["category"])
+        with mock.patch("new_system_onboarding._generate_profile") as generator:
+            archives_created = ingest(
+                study_done, personal, "Personal", "d" * 32,
+                "22222222-2222-2222-2222-222222222222",
+            )
+        generator.assert_not_called()
+        self.assertEqual("archives-created", archives_created.phase)
+        self.assertEqual(
+            (
+                ("Study", "c" * 32, "11111111-1111-1111-1111-111111111111"),
+                ("Personal", "d" * 32, "22222222-2222-2222-2222-222222222222"),
+            ),
+            archives_created.archives,
+        )
+        self.assertIsNone(archives_created.profile_content)
+        self.assertIsNone(next_action(archives_created))
+
+    def test_archive_result_mismatch_failure_and_replay_stop_progression(self):
+        parent = "3b6b3d84-ad2c-8093-bb53-d7fb734df559"
+        state = from_verified_source(parent, ["Study", "Personal"], "a" * 32, "11111111-1111-1111-1111-111111111111")
+        action = next_action(state)
+        valid = _archive_result(parent, "c" * 32, "22222222-2222-2222-2222-222222222222", "Study")
+        cases = (
+            ({"result": valid.replace("Study", "Other", 1)}, "write-unresolved"),
+            ({"result": valid.replace(parent.replace("-", ""), "e" * 32)}, "write-unresolved"),
+            ({"status": "no-op"}, "write-failed"),
+            ({"status": "partial"}, "write-unresolved"),
+            ({"status": "unknown"}, "write-unresolved"),
+        )
+        for raw, phase in cases:
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as root:
+                expected = expected_state(state, action); ledger = ApprovalLedger()
+                envelope = ledger.issue(ledger.preview(action, expected), accepted=True)
+                dispatch = prepare_journal_archive_dispatch(ledger, envelope, state, action, expected, RecoveryJournal(root))
+                result = ingest_journal_archive_dispatch(state, action, RecoveryJournal(root), dispatch.action_digest, dispatch.attempt_fingerprint, raw)
+                self.assertEqual(phase, result.phase)
+                self.assertEqual("write-unresolved", ingest_journal_archive_dispatch(state, action, RecoveryJournal(root), dispatch.action_digest, dispatch.attempt_fingerprint, raw).phase)
     def test_confirmed_input_produces_one_deterministic_first_action(self):
         state = begin("blank-page", ["Research", "Writing"])
 
@@ -161,7 +324,7 @@ class NewSystemOnboardingTests(unittest.TestCase):
         with self.assertRaises(TypeError): copy.copy(execution)
         with self.assertRaises(TypeError): copy.deepcopy(execution)
         with self.assertRaises(TypeError): pickle.dumps(execution)
-        wrong_state = type(state)(state.target_page_id, state.categories, "write-unresolved")
+        wrong_state = from_verified_source(state.target_page_id, state.categories, "a" * 32, "11111111-1111-1111-1111-111111111111")
         self.assertEqual("write-unresolved", ingest_execution(wrong_state, action, execution).phase)
         wrong_action = dict(action); wrong_action["target"] = {"page_id": "other"}
         self.assertEqual("write-unresolved", ingest_execution(state, wrong_action, execution).phase)
