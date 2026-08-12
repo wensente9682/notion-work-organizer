@@ -1,5 +1,3 @@
-<!-- Progressive-disclosure preview only. This is not the published README. -->
-
 # Organize — Codex + Notion Daily Work Tracker
 
 > An approval-first Codex + Notion starter kit for tracking daily work and
@@ -11,7 +9,9 @@ Organize helps you start with an existing work system or build a focused new
 one, then use Total and Organize to review completed work without losing useful
 takeaways.
 
-## Hero
+<p align="center">
+  <img src="assets/readme/hero.svg" width="100%" alt="Two starting paths—an existing work database through read-only adoption or a blank dedicated page through guided approved setup—join Daily Work, optional Total, Organize review, and approved reusable records. Source cleanup remains behind a separate done then confirm gate.">
+</p>
 
 ## Choose Your Starting Path
 
@@ -69,6 +69,14 @@ Prerequisites: Git, Codex, and access to the Notion connector.
 ## Core Workflow
 
 `Choose or create → Track daily work → Total → Organize → Preserve reusable records → done → confirm`
+
+<p align="center">
+  <img src="assets/readme/total-card.svg" width="600" alt="Total: count completed time in a selected month. Read-only.">
+</p>
+
+<p align="center">
+  <img src="assets/readme/organize-card.svg" width="600" alt="Organize: archive completed work and record takeaways and improvements. Archive changes require separate approval.">
+</p>
 
 - **Track:** record work, completion, Category, time blocks, and optional
   takeaways or improvements.
