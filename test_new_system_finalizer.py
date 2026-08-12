@@ -70,7 +70,11 @@ class NewSystemFinalizerTests(unittest.TestCase):
             result = finalizer.generate_profile(ready_snapshot())
             self.assertEqual("ready", result.status)
             self.assertIsInstance(result.content, bytes)
-            self.assertEqual("new-system-v0.3", json.loads(result.content)["mode"])
+            profile = json.loads(result.content)
+            self.assertEqual("new-system-v0.3", profile["mode"])
+            self.assertEqual("source-canary", profile["source_database_id"])
+            self.assertEqual("container-canary", profile["archive_tables_page_id"])
+            self.assertEqual({"category-canary": "archive-canary"}, profile["archive_tables"])
             self.assertFalse((Path(root) / ".todo_archive" / "new_system_profile.json").exists())
             _ = Trap()  # the generation seam has no Total/Organize collaborators to call
 

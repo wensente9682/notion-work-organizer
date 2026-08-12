@@ -27,6 +27,13 @@ def _failed() -> NewSystemReadinessReport:
     return NewSystemReadinessReport("not-ready", {}, None, None, ())
 
 
+def _has_required_properties(actual: object, required: Mapping[str, str]) -> bool:
+    return type(actual) is dict and all(
+        actual.get(name) == property_type
+        for name, property_type in required.items()
+    )
+
+
 def _row_to_item(row: dict[str, object]) -> TotalItem:
     done = row.get("Done")
     category = row.get("Category")
@@ -82,11 +89,12 @@ def verify_new_system_readiness(
         profile = json.loads(profile_content)
         if not profile_is_valid(profile):
             return _failed()
-        if source_schema != SOURCE_PROPERTIES or type(archive_schemas) is not dict:
+        if not _has_required_properties(source_schema, SOURCE_PROPERTIES) or type(archive_schemas) is not dict:
             return _failed()
         categories = tuple(profile["source"]["categories"])
         if set(archive_schemas) != set(categories) or any(
-            archive_schemas[category] != ARCHIVE_PROPERTIES for category in categories
+            not _has_required_properties(archive_schemas[category], ARCHIVE_PROPERTIES)
+            for category in categories
         ):
             return _failed()
         if type(source_rows) is not list or len(source_rows) > 100 or any(type(row) is not dict for row in source_rows):

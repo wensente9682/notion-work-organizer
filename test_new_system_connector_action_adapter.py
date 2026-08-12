@@ -60,6 +60,10 @@ def archive_action(display_name="Synthetic Archive"):
     }
 
 
+def saved_view_action():
+    return {"kind": "create_saved_view", "target": {"database": "db", "data_source": "ds"}, "payload": {"name": "Total", "type": "table", "configure": 'SORT BY "Work Date" DESC'}}
+
+
 class DynamicTrap:
     def __init__(self, calls):
         self.calls = calls
@@ -81,14 +85,17 @@ class SyntheticConnector:
         self.write_value = write
         self.read_calls = 0
         self.write_calls = 0
+        self.requests = []
 
     def read_canonical(self, _request):
+        self.requests.append(_request)
         self.read_calls += 1
         if isinstance(self.read_value, BaseException):
             raise self.read_value
         return self.read_value
 
     def write_canonical(self, _request):
+        self.requests.append(_request)
         self.write_calls += 1
         if isinstance(self.write_value, BaseException):
             raise self.write_value
@@ -109,6 +116,15 @@ def approved(ledger, current_action=None, expected=None):
 
 
 class CanonicalConnectorActionAdapterRedGate(unittest.TestCase):
+    def test_saved_view_projects_exact_real_request_once(self):
+        connector = SyntheticConnector()
+        subject = adapter(connector)
+        action_value = saved_view_action()
+        expected = {"database_id": "db", "data_source_id": "ds", "name": "Total", "type": "table", "configure": 'SORT BY "Work Date" DESC'}
+        subject.read_exact(action_value)
+        subject.write_once(action_value)
+        self.assertEqual([expected, expected], connector.requests)
+        self.assertEqual((1, 1), (connector.read_calls, connector.write_calls))
     def test_archive_mapping_protocol_and_str_subclass_bypasses_are_zero_io(self):
         calls = []
 

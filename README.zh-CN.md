@@ -8,17 +8,16 @@ Organize 帮助你采用、追踪、复盘并维护一套轻量的 Notion 日常
 它让进行中的工作保持简单，同时补上有意识的完成后闭环，避免任务结束后有用经验随之消失。
 所有受支持的 Notion 写入和清理步骤都保持可见，并以明确批准为前提。
 
-[**使用当前可用的现有列表路径 →**](#现有-notion-列表路径)
+[**选择起始路径 →**](#选择你的起点)
 
-> **产品状态：**现有列表采用路径已经可用：只读检查、经批准且被 Git 忽略的
-> 私有 profile，以及同一 profile 的 Total/Organize readiness 均已实现。
-> New System provisioning 规划在 v0.3，当前不是可执行路径。
+> **产品状态：**v0.3.1 产品开发已完成，两条起始路径均可用：可只读采用已有工作
+> 数据库，或从 blank / dedicated Notion page 新建工作数据库。
 
 <a id="choose-your-starting-path"></a>
 
 ## 选择你的起点
 
-### 使用现有 Notion 列表 — 当前可用
+### 使用已有工作数据库
 
 从你已经在使用的工作系统开始。Organize 先以只读方式检查，报告哪些部分
 `ready`、`missing` 或 `incompatible`，映射受支持的字段和归档目标，并提出
@@ -26,11 +25,12 @@ Total 与 Organize 所需的私有配置。
 
 [查看现有列表路径](#现有-notion-列表路径)
 
-### 建立新的 Notion 系统 — 规划于 v0.3
+### 新建工作数据库
 
-这条未来路径将帮助尚无兼容 workspace 的用户创建 source list、category
-archives、ordered view、date anchors、block field 和私有配置。当前版本不会
-创建或调整这些 workspace 结构。
+从 blank 或 dedicated Notion page 开始。Organize 会建议 Category；你可以接受、
+删除、改名或新增，然后确认当前列表。产品会通过可见、逐项批准的步骤建立所需的
+Daily Work、按 `Work Date DESC` 排序的 Total saved view、archive databases、
+mappings 和 private profile。
 
 ## 适合谁
 
@@ -83,15 +83,21 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
    ```
 
 2. 新建 Codex 任务，并只为 Organize 应使用的页面和数据库启用 Notion connector。
-3. 从当前可用的现有列表路径开始：
+3. 选择一条起始路径：
 
-   **现有列表**
+   **使用已有工作数据库**
 
    ```text
    Use Organize with my existing Notion to-do list. Start read-only.
    ```
 
-4. 同一 profile 的 readiness 检查通过后，先查看月份统计，再整理当月已完成工作：
+   **新建工作数据库**
+
+   ```text
+   Create a new work database on my blank or dedicated Notion page. Suggest Categories and wait for my confirmation.
+   ```
+
+4. setup 或 adoption ready 后，先查看月份统计，再整理当月已完成工作：
 
    ```text
    total 2026-07
@@ -113,8 +119,10 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 - 正常运行环境是 Codex + Notion connector。
 - 现有列表 Adopt 从只读检查开始。
 - 计划、检查、映射和 preview 都不授权 Notion 写入。
-- 每一次 archive write 或本地私有 profile 变更，都需要针对该动作的明确批准。
-  未来 New System provisioning 也必须保持同样的逐项批准边界。
+- 每一次 New System Notion write 都有精确、面向用户的 preview；批准只授权该
+  exact action 一次，写入前会 recheck，connector 最多调用一次。
+- confirmed failure、ambiguous、partial 或 unknown outcome 都会停止流程，绝不
+  自动 retry。
 - `ok` 和 `dismiss` 不移除源记录。`done` 只做汇总；只有单独的 `confirm`
   才能最终清理 eligible rows。
 - 清理使用 Notion 可恢复的 archived 状态，而不是永久删除。
@@ -124,8 +132,8 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 ## 当前边界
 
 - Organize 在 Codex 中配合 Notion connector 运行，不提供单独应用或 GUI。
-- New System provisioning 规划在 v0.3。当前版本不会创建或调整 database、
-  field、view 或 archive target。
+- New System setup 只会通过逐 action approval 创建用户确认的 Daily Work 结构、
+  所需 Total saved view 和 archive support；不会静默修改 workspace。
 - Adopt 不会广泛扫描、去重、修复或维护无关的 Notion 内容。
 - Total 只读取已配置 ordered view，只统计 completed items，不读取 archive，
   也不重建已被 Organize 清理的工作。
@@ -152,21 +160,18 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 检查或 profile 批准都不授权 Notion mutation、archive write 或 source cleanup。
 遇到含糊、不可访问、不完整、不受支持或外部已变更的输入时，流程安全停止。
 
-## 新的 Notion 系统路径 — 规划于 v0.3
+## 新建工作数据库路径
 
-这是为尚无兼容日常工作系统的用户规划的未来路径。当前版本不能执行该路径，
-也没有用于 provisioning workspace 的 Quick Start prompt 或命令。
+如果尚无兼容的日常工作系统，请使用这条路径。
 
-v0.3 路径预计会：
+1. 选择 blank 或 dedicated Notion page。
+2. 查看建议的 Category，再接受、删除、改名或新增，并确认当前列表。
+3. 查看并批准每一个 exact setup write。Organize 先建立 Daily Work，再创建并验证
+   按 `Work Date DESC` 排序的 Total saved view，然后建立所需的 archive databases、
+   mappings 和 private profile。
+4. setup complete 后，像正常产品功能一样使用 Total 和 Organize。
 
-- 从只读计划和 `ready` / `missing` 检查开始；
-- 只在针对每个具体动作获得批准后，创建或调整 database、field、view、
-  archive target 或配置；
-- 只有同一个已批准 private profile 通过 Total 只读兼容性验证并进入 Organize
-  只读 preview 后才完成。
-
-在该能力实现并通过验收前，请对兼容的 Notion 工作系统使用现有列表路径。
-未来的 readiness 仍不会授权创建 archive records 或清理 source。
+New System setup 不会授权创建 archive records 或清理 source。
 
 ## 必需 Schema
 

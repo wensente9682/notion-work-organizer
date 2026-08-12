@@ -26,6 +26,7 @@ _MAX_STRING_BYTES = 128
 _MAX_TOTAL_BYTES = 256
 _MAX_CANONICAL_BYTES = 768
 _SCHEMAS = {
+    "create_saved_view": ({"database", "data_source"}, {"name", "type", "configure"}),
     "create_database": ({"parent"}, {"schema"}),
     "configure_property": ({"database", "property"}, {"type"}),
     "configure_view_sort": ({"database", "view"}, {"sort"}),
@@ -244,6 +245,14 @@ def _connector_request(action: dict[str, object]) -> dict[str, object]:
     if action["kind"] == "create_database" and set(action.get("payload", {})) == {"request"}:
         return action["payload"]["request"]
     if action["kind"] != "create_archive_target":
+        if action["kind"] == "create_saved_view":
+            return {
+                "database_id": action["target"]["database"],
+                "data_source_id": action["target"]["data_source"],
+                "name": action["payload"]["name"],
+                "type": action["payload"]["type"],
+                "configure": action["payload"]["configure"],
+            }
         return action
     return action["connector_projection"]["request"]
 

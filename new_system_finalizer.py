@@ -44,7 +44,7 @@ class FinalizationReport:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ProfileGenerationResult:
     """A validated, unpublished private-profile payload."""
 
@@ -171,6 +171,11 @@ class NewSystemFinalizer:
                 }
             profile = {
                 "mode": "new-system-v0.3",
+                "source_database_id": source["id"],
+                "archive_tables_page_id": container["id"],
+                "archive_tables": {
+                    category: archive["id"] for category, archive in safe_archives.items()
+                },
                 "source": {
                     "id": source["id"],
                     "properties": {name: source["properties"][name] for name in SOURCE_PROPERTIES},

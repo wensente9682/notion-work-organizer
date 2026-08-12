@@ -32,7 +32,7 @@ _FIELDS = (
 _ARCHIVE_SCHEMA = {"Task": "title", "Takeaway": "rich_text", "Improvement": "rich_text"}
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, repr=False)
 class InitialSetupState:
     target_page_id: str
     categories: tuple[str, ...]
@@ -43,6 +43,7 @@ class InitialSetupState:
     result_status: str | None = None
     archives: tuple[tuple[str, str, str], ...] = ()
     profile_content: bytes | None = None
+    view_id: str | None = None
 
     def __init__(self, *args, **kwargs):
         raise TypeError("setup state is backend-owned")
@@ -57,9 +58,9 @@ class InitialSetupState:
         raise TypeError("setup state is not serializable")
 
     @classmethod
-    def _new(cls, target_page_id, categories, phase="pre-source", source_database_id=None, source_data_source_id=None, action_digest=None, result_status=None, archives=(), profile_content=None):
+    def _new(cls, target_page_id, categories, phase="pre-source", source_database_id=None, source_data_source_id=None, action_digest=None, result_status=None, archives=(), profile_content=None, view_id=None):
         value = object.__new__(cls)
-        for name, item in (("target_page_id", target_page_id), ("categories", categories), ("phase", phase), ("source_database_id", source_database_id), ("source_data_source_id", source_data_source_id), ("action_digest", action_digest), ("result_status", result_status), ("archives", archives), ("profile_content", profile_content)):
+        for name, item in (("target_page_id", target_page_id), ("categories", categories), ("phase", phase), ("source_database_id", source_database_id), ("source_data_source_id", source_data_source_id), ("action_digest", action_digest), ("result_status", result_status), ("archives", archives), ("profile_content", profile_content), ("view_id", view_id)):
             object.__setattr__(value, name, item)
         return value
 
@@ -111,7 +112,13 @@ def next_action(state: object) -> dict[str, object] | None:
             }
         },
         }
-    if state.phase != "source-created" or len(state.archives) >= len(state.categories):
+    if state.phase == "source-created":
+        return {
+            "kind": "create_saved_view",
+            "target": {"database": state.source_database_id, "data_source": state.source_data_source_id},
+            "payload": {"name": "Total", "type": "table", "configure": 'SORT BY "Work Date" DESC'},
+        }
+    if state.phase != "view-created" or len(state.archives) >= len(state.categories):
         return None
     category = state.categories[len(state.archives)]
     archive_action = {
@@ -128,6 +135,8 @@ def preview(state: object, action: object) -> str:
     if action["kind"] == "create_archive_target":
         category = action["target"]["category"]
         return f"Create the “{category}” archive database in the confirmed dedicated page.\nFields: Task, Takeaway, Improvement."
+    if action["kind"] == "create_saved_view":
+        return "Create the “Total” saved view for Daily Work.\nIt will be configured to sort by Work Date, newest first."
     try:
         request = action["payload"]["request"]
         parent = action["target"]["page_id"]
@@ -160,7 +169,68 @@ def expected_state(state: object, action: object) -> dict[str, object]:
         if state.archives:
             observed["archives"] = [{"category": category, "database_id": database_id, "data_source_id": data_source_id} for category, database_id, data_source_id in state.archives]
         return observed
+    if action["kind"] == "create_saved_view":
+        return {"database": state.source_database_id, "data_source": state.source_data_source_id, "name": "Total", "configure": 'SORT BY "Work Date" DESC'}
     return {"blank": True, "parent": state.target_page_id}
+
+
+def prepare_journal_view_dispatch(ledger: object, envelope: object, state: object, action: object, observed: object, journal: object):
+    if type(ledger) is not ApprovalLedger or type(journal) is not RecoveryJournal or type(state) is not InitialSetupState or state.phase != "source-created" or action != next_action(state):
+        return None
+    expected = expected_state(state, action)
+    claimed = ledger.claim_for_write(envelope)
+    if type(claimed) is not _ClaimDecision or type(claimed.claim) is not AttemptClaim or observed != expected or claimed.action_canonical != canonical_action_bytes(action) or claimed.expected_state_canonical != canonical_expected_state_bytes(expected):
+        return None
+    if ledger.finalize_write_attempt(claimed.claim, action, observed).authorized is not True:
+        return None
+    for phase in ("prepared", "read-completed", "write-ready"):
+        if journal.transition(phase, _journal_facts(claimed.action_digest, claimed.attempt_fingerprint, phase)).to_public_dict().get("status") != "accepted":
+            return None
+    request = {"database_id": state.source_database_id, "data_source_id": state.source_data_source_id, "name": "Total", "type": "table", "configure": 'SORT BY "Work Date" DESC'}
+    return JournalSourceDispatch(json.dumps(request, sort_keys=True, separators=(",", ":")), claimed.action_digest, claimed.attempt_fingerprint)
+
+
+def ingest_journal_view_dispatch(state: object, action: object, journal: object, digest: object, attempt: object, result: object) -> InitialSetupState:
+    if type(state) is not InitialSetupState or type(journal) is not RecoveryJournal or state.phase != "source-created" or action != next_action(state) or digest != _digest(action) or type(attempt) is not str:
+        return InitialSetupState._new("invalid", ("invalid",), "write-unresolved")
+    expected = expected_state(state, action)
+    view_id = result.get("view_id") if type(result) is dict else None
+    used = {_identity_key(state.target_page_id), _identity_key(state.source_database_id), _identity_key(state.source_data_source_id)}
+    for _, database_id, data_source_id in state.archives:
+        used.update({_identity_key(database_id), _identity_key(data_source_id)})
+    valid = type(result) is dict and result.get("status") == "success" and _identity_key(view_id) is not None and _identity_key(view_id) not in used and all(result.get(k) == v for k, v in expected.items())
+    terminal = "confirmed-applied" if valid else "confirmed-not-applied" if type(result) is dict and result.get("status") in {"failed", "failure", "no-op", "changed"} else "outcome-unknown"
+    if journal.consume_source_dispatch(digest, attempt, terminal).to_public_dict().get("status") != "accepted":
+        return InitialSetupState._new(state.target_page_id, state.categories, "write-unresolved", state.source_database_id, state.source_data_source_id)
+    if valid:
+        return InitialSetupState._new(state.target_page_id, state.categories, "view-created", state.source_database_id, state.source_data_source_id, view_id=result["view_id"])
+    return InitialSetupState._new(state.target_page_id, state.categories, "write-failed" if terminal == "confirmed-not-applied" else "write-unresolved", state.source_database_id, state.source_data_source_id)
+
+
+def run_journal_view_runtime(
+    ledger: object, envelope: object, state: object, observed: object,
+    journal: object, invoke_connector: object,
+) -> InitialSetupState:
+    """Run the one approved Total-view write through its journal-bound attempt."""
+    if type(state) is not InitialSetupState:
+        return InitialSetupState._new("invalid", ("invalid",), "write-unresolved")
+    action = next_action(state)
+    dispatch = prepare_journal_view_dispatch(ledger, envelope, state, action, observed, journal)
+    if dispatch is None:
+        return InitialSetupState._new(
+            state.target_page_id, state.categories, "write-unresolved",
+            state.source_database_id, state.source_data_source_id,
+        )
+    try:
+        request = json.loads(dispatch.request_json)
+        if type(request) is not dict:
+            raise ValueError
+        raw_result = invoke_connector(request)
+    except BaseException:
+        raw_result = {"status": "unknown"}
+    return ingest_journal_view_dispatch(
+        state, action, journal, dispatch.action_digest, dispatch.attempt_fingerprint, raw_result,
+    )
 
 
 def _build_source_dispatch_channel():
@@ -314,7 +384,7 @@ prepare_source_dispatch, source_dispatch_request, _source_dispatch_identifiers, 
 del _build_source_dispatch_channel
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class JournalSourceDispatch:
     request_json: str
     action_digest: str
@@ -485,7 +555,7 @@ def prepare_journal_archive_dispatch(
 ) -> JournalSourceDispatch | None:
     if (
         type(ledger) is not ApprovalLedger or type(journal) is not RecoveryJournal
-        or type(state) is not InitialSetupState or state.phase != "source-created"
+        or type(state) is not InitialSetupState or state.phase != "view-created"
         or action != next_action(state)
     ):
         return None
@@ -530,11 +600,18 @@ def _generate_profile(state: InitialSetupState, archives: tuple[tuple[str, str, 
     archive_ids = {category: database_id for category, database_id, _ in archives}
     blueprint = canonical_blueprint(archive_container_id=state.target_page_id, archive_databases=archive_ids)
     blueprint["source"]["id"] = state.source_database_id
-    blueprint["view"]["id"] = state.source_data_source_id
+    blueprint["view"]["id"] = state.view_id
     result = NewSystemFinalizer(
         Path(".todo_archive") / "new_system_profile.json", ignore_checker=lambda _: True,
     ).generate_profile(blueprint)
-    return result.content if result.status == "ready" and type(result.content) is bytes else None
+    if result.status != "ready" or type(result.content) is not bytes or type(state.view_id) is not str or not state.view_id.strip():
+        return None
+    try:
+        profile = json.loads(result.content)
+        profile["total"] = {"view_id": state.view_id, "fields": {"done": "Done", "categories": "Category", "timeboxing": "Time Blocks", "date_anchor": "Work Date"}, "category_relations": {}}
+        return (json.dumps(profile, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    except (TypeError, ValueError, UnicodeError):
+        return None
 
 
 def profile_is_valid(profile: object) -> bool:
@@ -548,7 +625,14 @@ def profile_is_valid(profile: object) -> bool:
             "archive_container": {"id": container["id"], "approved": True},
             "archives": {category: {"id": archive["id"], "parent_id": archive["parent_id"], "category": archive["category"], "properties": dict(archive["properties"])} for category, archive in archives.items()},
         }
-        return validate_canonical_blueprint(blueprint).status == "ready"
+        return (
+            validate_canonical_blueprint(blueprint).status == "ready"
+            and profile["source_database_id"] == source["id"]
+            and profile["archive_tables_page_id"] == container["id"]
+            and profile["archive_tables"] == {
+                category: archive["id"] for category, archive in archives.items()
+            }
+        )
     except (KeyError, TypeError, ValueError):
         return False
 
@@ -558,7 +642,7 @@ def ingest_journal_archive_dispatch(
     attempt_fingerprint: object, raw_result: object,
 ) -> InitialSetupState:
     if (
-        type(state) is not InitialSetupState or state.phase != "source-created"
+        type(state) is not InitialSetupState or state.phase != "view-created"
         or action != next_action(state) or type(journal) is not RecoveryJournal
         or action_digest != _digest(action) or type(attempt_fingerprint) is not str
     ):
@@ -581,9 +665,21 @@ def ingest_journal_archive_dispatch(
         return InitialSetupState._new(state.target_page_id, state.categories, phase, state.source_database_id, state.source_data_source_id, action_digest, phase, state.archives, state.profile_content)
     updated = state.archives + ((category, database_id, data_source_id),)
     completed = len(updated) == len(state.categories)
+    profile_content = _generate_profile(state, updated) if completed else None
+    if profile_content is not None:
+        try:
+            profile_content = profile_content if profile_is_valid(json.loads(profile_content)) else None
+        except (TypeError, ValueError, UnicodeError):
+            profile_content = None
+    if completed and profile_content is None:
+        return InitialSetupState._new(
+            state.target_page_id, state.categories, "archives-created",
+            state.source_database_id, state.source_data_source_id, action_digest,
+            "profile-not-ready", updated, None,
+        )
     return InitialSetupState._new(
-        state.target_page_id, state.categories, "archives-created" if completed else "source-created",
-        state.source_database_id, state.source_data_source_id, action_digest, "completed", updated, None,
+        state.target_page_id, state.categories, "setup-complete" if completed else "view-created",
+        state.source_database_id, state.source_data_source_id, action_digest, "completed", updated, profile_content, state.view_id,
     )
 
 

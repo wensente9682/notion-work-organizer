@@ -11,10 +11,14 @@ from unittest import mock
 
 from new_system_approval import ApprovalLedger
 from new_system_connector_action_adapter import CanonicalConnectorActionAdapter
+from new_system_finalizer import ProfileGenerationResult
 from new_system_onboarding import (
     begin, from_verified_source, expected_state, ingest_execution, ingest_source_dispatch,
     ingest_journal_archive_dispatch, ingest_journal_source_dispatch, next_action, prepare_journal_archive_dispatch, prepare_journal_source_dispatch,
     profile_for, profile_is_valid,
+    prepare_journal_view_dispatch, ingest_journal_view_dispatch,
+    InitialSetupState, JournalSourceDispatch,
+    run_journal_view_runtime,
     prepare_source_dispatch, preview, source_dispatch_request,
 )
 from new_system_recovery_journal import RecoveryJournal
@@ -29,43 +33,110 @@ def _archive_result(parent, database, source, title):
     )
 
 
+def _view_created(state):
+    action = next_action(state); expected = expected_state(state, action); ledger = ApprovalLedger()
+    envelope = ledger.issue(ledger.preview(action, expected), accepted=True)
+    with tempfile.TemporaryDirectory() as root:
+        journal = RecoveryJournal(root)
+        dispatch = prepare_journal_view_dispatch(ledger, envelope, state, action, expected, journal)
+        return ingest_journal_view_dispatch(state, action, journal, dispatch.action_digest, dispatch.attempt_fingerprint, {"status": "success", "view_id": "44444444-4444-4444-4444-444444444444", **expected})
+
+
 class NewSystemOnboardingTests(unittest.TestCase):
-    def test_verified_source_has_one_backend_owned_first_archive_action_and_english_preview(self):
+    def test_private_setup_values_are_redacted_from_repr(self):
+        state = InitialSetupState._new(
+            "synthetic-target-id", ("Synthetic Category",), "setup-complete",
+            "synthetic-source-id", "synthetic-data-source-id",
+            archives=(("Synthetic Category", "synthetic-archive-id", "synthetic-archive-source-id"),),
+            profile_content=b"synthetic-profile-secret", view_id="synthetic-view-id",
+        )
+        dispatch = JournalSourceDispatch(
+            '{"database_id":"synthetic-request-id"}', "synthetic-digest", "synthetic-attempt",
+        )
+        for value, secrets in (
+            (state, ("synthetic-target-id", "Synthetic Category", "synthetic-profile-secret", "synthetic-view-id")),
+            (dispatch, ("synthetic-request-id", "synthetic-digest", "synthetic-attempt")),
+            (ProfileGenerationResult("ready", b"synthetic-generated-profile"), ("synthetic-generated-profile",)),
+        ):
+            with self.subTest(value=type(value).__name__):
+                rendered = repr(value)
+                self.assertTrue(rendered)
+                self.assertTrue(all(secret not in rendered for secret in secrets))
+
+    def test_normal_view_runtime_prepares_then_invokes_once_and_ingests_same_attempt(self):
         state = from_verified_source(
-            "3b6b3d84-ad2c-8093-bb53-d7fb734df559",
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", ["Study"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+        action, observed, ledger = next_action(state), None, ApprovalLedger()
+        observed = expected_state(state, action)
+        envelope = ledger.issue(ledger.preview(action, observed), accepted=True)
+        calls = []
+        with tempfile.TemporaryDirectory() as root:
+            journal = RecoveryJournal(root)
+
+            def connector(request):
+                calls.append(request)
+                self.assertEqual("write-ready", journal.resume_review().to_public_dict()["phase"])
+                return {
+                    "status": "success",
+                    "view_id": "44444444-4444-4444-4444-444444444444",
+                    **observed,
+                }
+
+            completed = run_journal_view_runtime(
+                ledger, envelope, state, observed, journal, connector,
+            )
+            replay = run_journal_view_runtime(
+                ledger, envelope, state, observed, journal, connector,
+            )
+        self.assertEqual("view-created", completed.phase)
+        self.assertEqual("44444444-4444-4444-4444-444444444444", completed.view_id)
+        self.assertEqual("write-unresolved", replay.phase)
+        self.assertEqual(1, len(calls))
+        self.assertEqual({
+            "database_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "data_source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "name": "Total", "type": "table", "configure": 'SORT BY "Work Date" DESC',
+        }, calls[0])
+
+    def test_public_view_dispatch_succeeds_once_then_replay_stops(self):
+        state = from_verified_source("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", ["Study"], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        action, expected, ledger = next_action(state), None, ApprovalLedger()
+        expected = expected_state(state, action)
+        envelope = ledger.issue(ledger.preview(action, expected), accepted=True)
+        with tempfile.TemporaryDirectory() as root:
+            journal = RecoveryJournal(root)
+            dispatch = prepare_journal_view_dispatch(ledger, envelope, state, action, expected, journal)
+            raw = {"status": "success", "view_id": "44444444-4444-4444-4444-444444444444", **expected}
+            missing = ingest_journal_view_dispatch(state, action, journal, dispatch.action_digest, None, raw)
+            mismatch = ingest_journal_view_dispatch(state, action, journal, dispatch.action_digest, "wrong-attempt", raw)
+            first = ingest_journal_view_dispatch(state, action, journal, dispatch.action_digest, dispatch.attempt_fingerprint, raw)
+            second = ingest_journal_view_dispatch(state, action, journal, dispatch.action_digest, dispatch.attempt_fingerprint, raw)
+        self.assertEqual(("view-created", "44444444-4444-4444-4444-444444444444"), (first.phase, first.view_id))
+        self.assertEqual("write-unresolved", missing.phase)
+        self.assertEqual("write-unresolved", mismatch.phase)
+        self.assertEqual("write-unresolved", second.phase)
+    def test_verified_source_has_one_backend_owned_first_saved_view_action_and_english_preview(self):
+        state = from_verified_source(
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
             ["Study", "Personal"],
-            "ad16f835af754222b11fda2cae3445c5",
-            "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )
 
         action = next_action(state)
 
         self.assertEqual(action, next_action(state))
-        self.assertEqual("create_archive_target", action["kind"])
+        self.assertEqual("create_saved_view", action["kind"])
         self.assertEqual(
-            {"container": "3b6b3d84-ad2c-8093-bb53-d7fb734df559", "category": "Study"},
+            {"database": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "data_source": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
             action["target"],
         )
+        self.assertEqual({"name": "Total", "type": "table", "configure": 'SORT BY "Work Date" DESC'}, action["payload"])
         self.assertEqual(
-            {"display_name": "Study", "schema": {
-                "Task": "title", "Takeaway": "rich_text", "Improvement": "rich_text",
-            }},
-            action["payload"],
-        )
-        self.assertEqual(
-            {
-                "operation": "create_database",
-                "request": {
-                    "parent": {"page_id": "3b6b3d84-ad2c-8093-bb53-d7fb734df559"},
-                    "title": "Study",
-                    "schema": 'CREATE TABLE ("Task" TITLE, "Takeaway" RICH_TEXT, "Improvement" RICH_TEXT)',
-                },
-            },
-            action["connector_projection"],
-        )
-        self.assertEqual(
-            "Create the “Study” archive database in the confirmed dedicated page.\n"
-            "Fields: Task, Takeaway, Improvement.",
+            "Create the “Total” saved view for Daily Work.\n"
+            "It will be configured to sort by Work Date, newest first.",
             preview(state, action),
         )
 
@@ -87,30 +158,31 @@ class NewSystemOnboardingTests(unittest.TestCase):
         self.assertFalse(hasattr(new_system_onboarding, "_state"))
 
     def test_verified_source_identities_are_globally_unique_after_uuid_normalization(self):
-        target = "3B6B3D84-AD2C-8093-BB53-D7FB734DF559"
-        source_database = "ad16f835af754222b11fda2cae3445c5"
-        source_data_source = "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce"
+        target = "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE"
+        source_database = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        source_data_source = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         state = from_verified_source(target, ["Study"], source_database, source_data_source)
         self.assertEqual("source-created", state.phase)
         for duplicate_database, duplicate_source in (
-            ("3b6b3d84ad2c8093bb53d7fb734df559", source_data_source),
-            (source_database, "3B6B3D84-AD2C-8093-BB53-D7FB734DF559"),
-            ("AD16F835-AF75-4222-B11F-DA2CAE3445C5", source_database.upper()),
+            ("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", source_data_source),
+            (source_database, "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE"),
+            ("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", source_database.upper()),
         ):
             with self.subTest(database=duplicate_database, source=duplicate_source), self.assertRaises(ValueError):
                 from_verified_source(target, ["Study"], duplicate_database, duplicate_source)
 
     def test_archive_recheck_uses_independent_observed_literal(self):
         state = from_verified_source(
-            "3b6b3d84-ad2c-8093-bb53-d7fb734df559", ["Study"],
-            "ad16f835af754222b11fda2cae3445c5", "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", ["Study"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )
+        state = _view_created(state)
         action = next_action(state)
         observed = {
-            "parent": "3b6b3d84-ad2c-8093-bb53-d7fb734df559",
+            "parent": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
             "source": {
-                "database_id": "ad16f835af754222b11fda2cae3445c5",
-                "data_source_id": "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+                "database_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "data_source_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             },
             "archive_count": 0,
             "next_category": "Study",
@@ -124,11 +196,12 @@ class NewSystemOnboardingTests(unittest.TestCase):
                     ledger, envelope, state, action, actual, RecoveryJournal(root),
                 )
                 self.assertEqual(actual == observed, dispatch is not None)
-    def test_source_created_plans_ordered_archives_then_stops_before_profile(self):
+    def test_source_created_plans_ordered_archives_then_generates_profile(self):
         state = from_verified_source(
-            "3b6b3d84-ad2c-8093-bb53-d7fb734df559", ["Study", "Personal"],
-            "ad16f835af754222b11fda2cae3445c5", "3d8bd9f5-02dc-4896-8353-d5c02e2a99ce",
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", ["Study", "Personal"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )
+        state = _view_created(state)
         study = next_action(state)
         self.assertEqual(("create_archive_target", "Study", "Study"), (study["kind"], study["target"]["category"], study["payload"]["display_name"]))
         self.assertIn("Create the “Study” archive database", preview(state, study))
@@ -146,31 +219,66 @@ class NewSystemOnboardingTests(unittest.TestCase):
         self.assertEqual(("Study", "c" * 32), (study_done.archives[0][0], study_done.archives[0][1]))
         personal = next_action(study_done)
         self.assertEqual("Personal", personal["target"]["category"])
-        with mock.patch("new_system_onboarding._generate_profile") as generator:
-            archives_created = ingest(
-                study_done, personal, "Personal", "d" * 32,
-                "22222222-2222-2222-2222-222222222222",
-            )
-        generator.assert_not_called()
-        self.assertEqual("archives-created", archives_created.phase)
+        setup_complete = ingest(
+            study_done, personal, "Personal", "d" * 32,
+            "22222222-2222-2222-2222-222222222222",
+        )
+        self.assertEqual("setup-complete", setup_complete.phase)
         self.assertEqual(
             (
                 ("Study", "c" * 32, "11111111-1111-1111-1111-111111111111"),
                 ("Personal", "d" * 32, "22222222-2222-2222-2222-222222222222"),
             ),
-            archives_created.archives,
+            setup_complete.archives,
         )
-        self.assertIsNone(archives_created.profile_content)
-        self.assertIsNone(next_action(archives_created))
+        self.assertIsInstance(setup_complete.profile_content, bytes)
+        self.assertTrue(profile_is_valid(profile_for(setup_complete)))
+        profile = profile_for(setup_complete)
+        self.assertEqual("44444444-4444-4444-4444-444444444444", profile["view"]["id"])
+        self.assertNotEqual(setup_complete.source_data_source_id, profile["view"]["id"])
+        self.assertEqual({"view_id": "44444444-4444-4444-4444-444444444444", "fields": {"done": "Done", "categories": "Category", "timeboxing": "Time Blocks", "date_anchor": "Work Date"}, "category_relations": {}}, profile["total"])
+        self.assertEqual("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", profile["source_database_id"])
+        self.assertEqual("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", profile["archive_tables_page_id"])
+        self.assertEqual({"Study": "c" * 32, "Personal": "d" * 32}, profile["archive_tables"])
+        self.assertIsNone(next_action(setup_complete))
+
+    def test_final_archive_invalid_profile_result_stays_noncomplete(self):
+        state = from_verified_source(
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", ["Study"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+        state = _view_created(state)
+        action = next_action(state)
+        expected = expected_state(state, action)
+        for generated in (ProfileGenerationResult("not-ready", None), ProfileGenerationResult("ready", b"{}")):
+            with self.subTest(generated=generated), tempfile.TemporaryDirectory() as root, mock.patch(
+                "new_system_onboarding.NewSystemFinalizer.generate_profile", return_value=generated,
+            ):
+                ledger = ApprovalLedger()
+                envelope = ledger.issue(ledger.preview(action, expected), accepted=True)
+                journal = RecoveryJournal(root)
+                dispatch = prepare_journal_archive_dispatch(ledger, envelope, state, action, expected, journal)
+                result = ingest_journal_archive_dispatch(
+                    state, action, journal, dispatch.action_digest, dispatch.attempt_fingerprint,
+                    {"result": _archive_result(
+                        state.target_page_id, "c" * 32,
+                        "11111111-1111-1111-1111-111111111111", "Study",
+                    )},
+                )
+            self.assertEqual("archives-created", result.phase)
+            self.assertEqual("profile-not-ready", result.result_status)
+            self.assertIsNone(result.profile_content)
+            self.assertIsNone(next_action(result))
 
     def test_archive_result_mismatch_failure_and_replay_stop_progression(self):
-        parent = "3b6b3d84-ad2c-8093-bb53-d7fb734df559"
+        parent = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
         state = from_verified_source(parent, ["Study", "Personal"], "a" * 32, "11111111-1111-1111-1111-111111111111")
+        state = _view_created(state)
         action = next_action(state)
         valid = _archive_result(parent, "c" * 32, "22222222-2222-2222-2222-222222222222", "Study")
         cases = (
             ({"result": valid.replace("Study", "Other", 1)}, "write-unresolved"),
-            ({"result": valid.replace(parent.replace("-", ""), "e" * 32)}, "write-unresolved"),
+            ({"result": valid.replace(parent.replace("-", ""), "f" * 32)}, "write-unresolved"),
             ({"status": "no-op"}, "write-failed"),
             ({"status": "partial"}, "write-unresolved"),
             ({"status": "unknown"}, "write-unresolved"),
