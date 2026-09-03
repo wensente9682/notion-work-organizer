@@ -24,8 +24,6 @@ class OrganizeConnectorContractTests(unittest.TestCase):
         expected_query = (
             'FROM "<collection_url>"\n'
             '   WHERE "<done_property>" = ?\n'
-            '     AND ("<takeaway_property>" IS NOT NULL\n'
-            '          OR "<improvement_property>" IS NOT NULL)\n'
             "   ORDER BY datetime(createdTime) ASC\n"
             "   LIMIT 10"
         )
@@ -36,6 +34,8 @@ class OrganizeConnectorContractTests(unittest.TestCase):
             "Run exactly one bounded query",
             "Bind the single parameter to `__YES__`",
             "`10` is the bounded read ceiling",
+            "Do not filter empty takeaway/improvement rows",
+            "pending-cleanup eligibility handles them",
         ):
             self.assertIn(requirement, self.real_read)
         sql_block = self.real_read.split("```sql\n", 1)[1].split("\n   ```", 1)[0]
@@ -58,29 +58,32 @@ class OrganizeConnectorContractTests(unittest.TestCase):
         self.assertNotIn('mode: "view"', self.real_read)
         self.assertNotIn("`view_url`", self.real_read)
 
-    def test_bounded_rows_are_batch_limited_before_candidate_metadata_fetch(self):
+    def test_bounded_rows_resolve_category_before_eligibility_and_batch_limit(self):
         for requirement in (
-            "remaining existing candidate eligibility rules",
-            "ascending `createdTime` order",
-            "configured `batch_size`",
-            "Fetch only those selected candidate pages",
+            "Fetch every bounded returned candidate page",
             "Resolve the configured category/project relation",
+            "pending cleanup for checked rows with empty takeaway and improvement",
+            "only after Category facts are resolved",
+            "remaining existing candidate eligibility rules",
+            "preserve ascending `createdTime`",
+            "configured `batch_size`",
             "related page identities",
             "`page_last_edited_at`",
             "one unique, stable page identity/URL",
             "stop the preview on missing, duplicate, or",
             "invalid values",
-            "if a selected page or required related category page cannot be resolved",
+            "if a candidate page or required related category page cannot be resolved",
             "page identity/URL",
             "existing read-only candidate preview",
         ):
             self.assertIn(requirement, self.real_read)
         ordered_steps = (
             "Require every returned record",
+            "Fetch every bounded returned candidate page",
+            "Resolve the configured category/project relation",
             "remaining existing candidate eligibility rules",
-            "ascending `createdTime` order",
+            "preserve ascending `createdTime`",
             "configured `batch_size`",
-            "Fetch only those selected candidate pages",
         )
         positions = [self.real_read.index(step) for step in ordered_steps]
         self.assertEqual(positions, sorted(positions))

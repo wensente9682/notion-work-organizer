@@ -230,31 +230,33 @@ For real-mode connector candidate reads, use this narrow mixed read path:
           "<takeaway_property>", "<improvement_property>"
    FROM "<collection_url>"
    WHERE "<done_property>" = ?
-     AND ("<takeaway_property>" IS NOT NULL
-          OR "<improvement_property>" IS NOT NULL)
    ORDER BY datetime(createdTime) ASC
    LIMIT 10
    ```
 
    Bind the single parameter to `__YES__`. `10` is the bounded read ceiling,
-   not the displayed batch size. Deliberately do not select the configured
+   not the displayed batch size. Do not filter empty takeaway/improvement rows
+   in SQL: existing pending-cleanup eligibility handles them after the page
+   facts are read. Deliberately do not select the configured
    category/project relation: projecting that relation can make a one-source
    query require multi-data-source capability and fail with `plan_required`.
    Do not add `lastEditedTime`, `OFFSET`, comments, multiple statements, or an
    alternate query fallback.
 3. Require every returned record to have one unique, stable page identity/URL
    and a parseable `createdTime`; stop the preview on missing, duplicate, or
-   invalid values. Apply the remaining existing candidate eligibility rules
-   locally, preserve ascending `createdTime` order, and then apply the
-   configured `batch_size`.
-4. Fetch only those selected candidate pages by their returned page identity or
-   URL. Resolve the configured category/project relation from the page fetch,
+   invalid values. Fetch every bounded returned candidate page by its returned
+   page identity or URL. Resolve the configured category/project relation from
+   each page fetch,
    fetching only its returned related page identities when their display names
    are not already present. Use each candidate page fetch's
    `page_last_edited_at` as the preview's `last edited` value; keep
    `createdTime` from the collection query as `added`. Stop the whole preview
-   if a selected page or required related category page cannot be resolved, or
+   if a candidate page or required related category page cannot be resolved, or
    if the candidate page omits `page_last_edited_at`.
+4. Apply the remaining existing candidate eligibility rules locally, including
+   pending cleanup for checked rows with empty takeaway and improvement. Do
+   this only after Category facts are resolved; preserve ascending `createdTime`
+   order, then apply the configured `batch_size`.
 5. Render the existing read-only candidate preview with the returned task,
    category, takeaway, improvement, page identity/URL, and system times.
 
