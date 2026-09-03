@@ -216,6 +216,52 @@ Then continue accepting the normal commands: `ok`, `dismiss`, `skip`, `undo`, `s
 
 ## Batch Selection
 
+For real-mode connector candidate reads, use this narrow mixed read path:
+
+1. Fetch the configured source data source and use the exact `collection://...`
+   URL returned by the connector.
+2. Run exactly one bounded query with `query-data-sources`. Set `mode: "sql"`,
+   pass the exact collection URL as the sole `data_source_urls` entry, resolve
+   the configured title, completion, takeaway, and improvement property names,
+   quote each Notion property identifier, and use only this query shape:
+
+   ```sql
+   SELECT url, createdTime, "<title_property>", "<done_property>",
+          "<takeaway_property>", "<improvement_property>"
+   FROM "<collection_url>"
+   WHERE "<done_property>" = ?
+     AND ("<takeaway_property>" IS NOT NULL
+          OR "<improvement_property>" IS NOT NULL)
+   ORDER BY datetime(createdTime) ASC
+   LIMIT 10
+   ```
+
+   Bind the single parameter to `__YES__`. `10` is the bounded read ceiling,
+   not the displayed batch size. Deliberately do not select the configured
+   category/project relation: projecting that relation can make a one-source
+   query require multi-data-source capability and fail with `plan_required`.
+   Do not add `lastEditedTime`, `OFFSET`, comments, multiple statements, or an
+   alternate query fallback.
+3. Require every returned record to have one unique, stable page identity/URL
+   and a parseable `createdTime`; stop the preview on missing, duplicate, or
+   invalid values. Apply the remaining existing candidate eligibility rules
+   locally, preserve ascending `createdTime` order, and then apply the
+   configured `batch_size`.
+4. Fetch only those selected candidate pages by their returned page identity or
+   URL. Resolve the configured category/project relation from the page fetch,
+   fetching only its returned related page identities when their display names
+   are not already present. Use each candidate page fetch's
+   `page_last_edited_at` as the preview's `last edited` value; keep
+   `createdTime` from the collection query as `added`. Stop the whole preview
+   if a selected page or required related category page cannot be resolved, or
+   if the candidate page omits `page_last_edited_at`.
+5. Render the existing read-only candidate preview with the returned task,
+   category, takeaway, improvement, page identity/URL, and system times.
+
+Do not use view mode for real candidate reads: it does not return the required
+`createdTime` and `lastEditedTime` fields. Do not use the CLI, token, or direct
+REST fallback for this path.
+
 For `organize todo-test`:
 
 1. Use the Notion connector to read/fetch the `to-do-test` schema if needed.
