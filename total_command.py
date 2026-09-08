@@ -86,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(
     argv: list[str] | None = None,
     *,
+    dependency_available: bool = False,
     token_loader: Callable[[], str] = _token,
     api_factory: Callable[[str], Any] = NotionViewsApi,
 ) -> int:
@@ -96,6 +97,12 @@ def main(
         target_month = date.fromisoformat(f"{args.month}-01")
     except ValueError:
         print("error: total requires a month in YYYY-MM format", file=sys.stderr)
+        return 1
+    if not dependency_available:
+        print(
+            "error: total is temporarily unavailable because the Notion Views API dependency is unavailable",
+            file=sys.stderr,
+        )
         return 1
     try:
         view_id, fields = _config(args.config)

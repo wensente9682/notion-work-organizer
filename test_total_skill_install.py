@@ -10,9 +10,27 @@ import unittest
 ROOT = Path(__file__).resolve().parent
 SKILL_SOURCE = ROOT / "skills" / "todo-archive-review"
 INSTALLER = SKILL_SOURCE / "scripts" / "install.py"
+SKILL_DOCUMENT = SKILL_SOURCE / "SKILL.md"
 
 
 class TotalSkillInstallTest(unittest.TestCase):
+    def test_monthly_total_documents_direct_views_keychain_exception(self):
+        document = SKILL_DOCUMENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Monthly Total is an explicit exception to the connector-first rule.",
+            document,
+        )
+        self.assertIn("Stage 4 Views API", document)
+        self.assertIn("single-use sandbox-external authorization", document)
+        self.assertIn("must not request or suggest persistent authorization", document)
+        self.assertIn("do not fall back to the Notion connector", document)
+        self.assertIn(
+            "temporarily unavailable because the Notion Views API dependency is unavailable",
+            document,
+        )
+        self.assertIn("<!-- Direct Views route retained for recovery:", document)
+
     def run_installer(self, target, *, cwd, home):
         return subprocess.run(
             [sys.executable, "-B", str(INSTALLER), "--target", str(target)],

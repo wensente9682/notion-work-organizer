@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import total_command
 from total_views import TotalViewError
@@ -71,6 +72,7 @@ class TotalCommandTest(unittest.TestCase):
                 argv,
                 token_loader=lambda: token,
                 api_factory=lambda supplied_token: api,
+                dependency_available=True,
             )
         return code, stdout.getvalue(), stderr.getvalue()
 
@@ -180,6 +182,27 @@ class TotalCommandTest(unittest.TestCase):
                     stderr.getvalue(),
                 )
 
+    def test_total_is_temporarily_unavailable_before_config_credentials_or_api(self):
+        def unexpected_call(*args, **kwargs):
+            raise AssertionError("unavailable gate must stop before this boundary")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with patch.object(total_command, "_config", unexpected_call):
+                code = total_command.main(
+                    ["2026-08"],
+                    token_loader=unexpected_call,
+                    api_factory=unexpected_call,
+                )
+
+        self.assertEqual(1, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual(
+            "error: total is temporarily unavailable because the Notion Views API dependency is unavailable\n",
+            stderr.getvalue(),
+        )
+
     def test_missing_or_malformed_private_config_fails_closed_without_api(self):
         def unexpected_api(token):
             raise AssertionError("API must not be constructed")
@@ -221,6 +244,7 @@ class TotalCommandTest(unittest.TestCase):
                             ["2026-07", "--config", str(path)],
                             token_loader=lambda: "token-example",
                             api_factory=unexpected_api,
+                            dependency_available=True,
                         )
                     self.assertEqual(1, code)
                     self.assertEqual("", stdout.getvalue())

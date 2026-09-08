@@ -20,17 +20,21 @@ Organize 帮助你采用、追踪、复盘并维护一套轻量的 Notion 日常
 ### 使用已有工作数据库
 
 从你已经在使用的工作系统开始。Organize 先以只读方式检查，报告哪些部分
+<!-- `ready`、`missing` 或 `incompatible`，映射受支持的字段和归档目标，并提出
+Total 与 Organize 所需的私有配置。 -->
 `ready`、`missing` 或 `incompatible`，映射受支持的字段和归档目标，并提出
-Total 与 Organize 所需的私有配置。
+Organize 所需的私有配置。
 
 [查看现有列表路径](#现有-notion-列表路径)
 
 ### 新建工作数据库
 
 从 blank 或 dedicated Notion page 开始。Organize 会建议 Category；你可以接受、
-删除、改名或新增，然后确认当前列表。产品会通过可见、逐项批准的步骤建立所需的
+<!-- 删除、改名或新增，然后确认当前列表。产品会通过可见、逐项批准的步骤建立所需的
 Daily Work、按 `Work Date DESC` 排序的 Total saved view、archive databases、
-mappings 和 private profile。
+mappings 和 private profile。 -->
+删除、改名或新增，然后确认当前列表。产品会通过可见、逐项批准的步骤建立所需的
+Daily Work、archive databases、mappings 和 private profile。
 
 ## 适合谁
 
@@ -49,26 +53,31 @@ Organize 不是独立任务管理器、单独 GUI、自动化平台或无人值�
 
 ## 核心工作流
 
-`Adopt → Track → total YYYY-MM → organize todo → Preserve → done → confirm`
+<!-- `Adopt → Track → total YYYY-MM → organize todo → Preserve → done → confirm` -->
+
+> **临时不可用提示：**Monthly Total 因 Notion Views API 依赖暂不可用。合法的
+> `total YYYY-MM` 会在访问 config、凭据、Keychain 或 Notion 前 fail closed。
+
+`Adopt → Track → organize todo → Preserve → done → confirm`
 
 1. **Adopt：**检查现有兼容系统，单独批准其本地私有 profile，并验证同一
    profile 的 readiness。
 2. **Track：**在 Notion 中记录日常工作、完成状态、Category、block text，以及
    可选的 Takeaway 或 Improvement。
-3. **查看月份统计：**如果需要，在 Organize 前运行 `total YYYY-MM`，只读查看
+<!-- 3. **查看月份统计：**如果需要，在 Organize 前运行 `total YYYY-MM`，只读查看
    已完成 blocks 的 Category 小计。这一步是推荐项而非强制依赖，也不会保存
-   历史报表。
-4. **复盘已完成工作：**运行 `organize todo`，再对每项选择 `ok`、`dismiss`
+   历史报表。 -->
+3. **复盘已完成工作：**运行 `organize todo`，再对每项选择 `ok`、`dismiss`
    或 `skip`。数字 `undo` 只适用于它受支持的当前 active batch 范围。
-5. **Preserve：**`Category` 把批准的记录路由到选定归档目标。归档行只包含
+4. **Preserve：**`Category` 把批准的记录路由到选定归档目标。归档行只包含
    `Task`、`Takeaway` 和 `Improvement`。
-6. **单独确认清理：**`done` 只显示汇总；只有后续 `confirm` 才能清理仍通过
+5. **单独确认清理：**`done` 只显示汇总；只有后续 `confirm` 才能清理仍通过
    全部检查的 eligible source rows。
 
 ![工作流概览：记录、追踪、完成、复盘、整理并归档日常工作](docs/workflow-overview.svg)
 
-_图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YYYY-MM`
-执行的每一次读取和校验。_
+<!-- _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YYYY-MM`
+执行的每一次读取和校验。_ -->
 
 ## 快速开始
 
@@ -97,7 +106,7 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
    Create a new work database on my blank or dedicated Notion page. Suggest Categories and wait for my confirmation.
    ```
 
-4. setup 或 adoption ready 后，先查看月份统计，再整理当月已完成工作：
+<!-- 4. setup 或 adoption ready 后，先查看月份统计，再整理当月已完成工作：
 
    ```text
    total 2026-07
@@ -105,8 +114,8 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
    ```
 
    `total` 只返回 Category block 小计和 overlapping grand total；它不展示任务
-   明细，也不修改 Notion。
-5. 检查每一次拟议写入。源记录清理始终位于独立的 `done` → `confirm` 安全门后。
+   明细，也不修改 Notion。 -->
+4. 检查每一次拟议写入。源记录清理始终位于独立的 `done` → `confirm` 安全门后。
 
 可以在
 [examples/session-output.example.txt](examples/session-output.example.txt)
@@ -116,7 +125,7 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 
 ## Approval-First 安全原则
 
-- 正常运行环境是 Codex + Notion connector。
+- 正常的 Setup、Adopt 和 Organize 运行环境是 Codex + Notion connector。
 - 现有列表 Adopt 从只读检查开始。
 - 计划、检查、映射和 preview 都不授权 Notion 写入。
 - 每一次 New System Notion write 都有精确、面向用户的 preview；批准只授权该
@@ -126,20 +135,28 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 - `ok` 和 `dismiss` 不移除源记录。`done` 只做汇总；只有单独的 `confirm`
   才能最终清理 eligible rows。
 - 清理使用 Notion 可恢复的 archived 状态，而不是永久删除。
-- Total 全程只读，不返回部分结果，也不会授予 Organize 任何批准。
+<!-- - Total 全程只读，不返回部分结果，也不会授予 Organize 任何批准。
+- Total 是 connector-first 的明确架构例外：每次运行使用本地 Python Stage 4 Views
+  API wrapper 与用户自行管理的 `NOTION_TOKEN` 或 Keychain 凭据，并单次申请沙箱外
+  授权；若授权被拒绝即停止，不 connector fallback，也不 retry。 -->
 - 公开示例不包含真实凭据、ID、URL、私有任务内容、用户名或本机路径。
 
 ## 当前边界
 
-- Organize 在 Codex 中配合 Notion connector 运行，不提供单独应用或 GUI。
-- New System setup 只会通过逐 action approval 创建用户确认的 Daily Work 结构、
-  所需 Total saved view 和 archive support；不会静默修改 workspace。
+- Setup、Adopt 和 Organize 在 Codex 中配合 Notion connector 运行，不提供单独应用
+  或 GUI。
+<!-- - New System setup 只会通过逐 action approval 创建用户确认的 Daily Work 结构、
+  所需 Total saved view 和 archive support；不会静默修改 workspace。 -->
+- New System setup 只会通过逐 action approval 创建用户确认的 Daily Work 结构和
+  archive support；不会静默修改 workspace。
 - Adopt 不会广泛扫描、去重、修复或维护无关的 Notion 内容。
-- Total 只读取已配置 ordered view，只统计 completed items，不读取 archive，
+<!-- Total 只读取已配置 ordered view，只统计 completed items，不读取 archive，
   也不重建已被 Organize 清理的工作。
 - Total 是调用时统计，不是保存的 dashboard 或历史报表系统。
 - 归档记录有意省略 source-only workflow fields。
-- Python CLI 是高级 fallback，而不是正常用户路径。
+- Monthly Total 是 connector-first 的明确例外：使用本地 Python `run_total.py` 与
+  Stage 4 Views API，而不是普通 connector 或 data-source query。通用 Python CLI
+  仍是高级 fallback，而不是正常用户路径。 -->
 
 ## 现有 Notion 列表路径
 
@@ -155,7 +172,8 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
    - Total 和 Organize 需要的 mappings。
 4. 确认拟议 mappings。
 5. 把创建或更新 ignored private profile 作为单独本地动作批准。
-6. 使用同一 profile 先做 Total 只读验证，再进入 Organize 只读 preview。
+<!-- 6. 使用同一 profile 先做 Total 只读验证，再进入 Organize 只读 preview。 -->
+6. 使用同一 profile 进入 Organize 只读 preview。
 
 检查或 profile 批准都不授权 Notion mutation、archive write 或 source cleanup。
 遇到含糊、不可访问、不完整、不受支持或外部已变更的输入时，流程安全停止。
@@ -166,10 +184,13 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 
 1. 选择 blank 或 dedicated Notion page。
 2. 查看建议的 Category，再接受、删除、改名或新增，并确认当前列表。
-3. 查看并批准每一个 exact setup write。Organize 先建立 Daily Work，再创建并验证
+<!-- 3. 查看并批准每一个 exact setup write。Organize 先建立 Daily Work，再创建并验证
    按 `Work Date DESC` 排序的 Total saved view，然后建立所需的 archive databases、
+   mappings 和 private profile。 -->
+3. 查看并批准每一个 exact setup write。Organize 建立 Daily Work、archive databases、
    mappings 和 private profile。
-4. setup complete 后，像正常产品功能一样使用 Total 和 Organize。
+<!-- 4. setup complete 后，像正常产品功能一样使用 Total 和 Organize。 -->
+4. setup complete 后可使用 Organize；Total 仍按顶部临时不可用提示冻结。
 
 New System setup 不会授权创建 archive records 或清理 source。
 
