@@ -234,12 +234,16 @@ For real-mode connector candidate reads, use this narrow mixed read path:
    LIMIT 10
    ```
 
-   Bind the single parameter to `__YES__`. `10` is the bounded read ceiling,
-   not the displayed batch size. Do not filter empty takeaway/improvement rows
-   in SQL: existing pending-cleanup eligibility handles them after the page
-   facts are read. Deliberately do not select the configured
-   category/project relation: projecting that relation can make a one-source
-   query require multi-data-source capability and fail with `plan_required`.
+   Call the connector with `data.mode: "sql"`, the exact collection URL as
+   the only entry in `data.data_source_urls`, the SQL above in `data.query`,
+   and exactly `data.params: ["__YES__"]`. The binding key is `params`.
+   Do not send `data.parameters` or any other additional key in `data`.
+   `10` is the bounded read ceiling, not the displayed batch size. Do not
+   filter empty takeaway/improvement rows in SQL: existing pending-cleanup
+   eligibility handles them after the page facts are read. Deliberately do not
+   select the configured category/project relation: projecting that relation
+   can make a one-source query require multi-data-source capability and fail
+   with `plan_required`.
    Do not add `lastEditedTime`, `OFFSET`, comments, multiple statements, or an
    alternate query fallback.
 3. Require every returned record to have one unique, stable page identity/URL

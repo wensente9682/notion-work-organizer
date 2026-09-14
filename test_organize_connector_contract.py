@@ -32,7 +32,8 @@ class OrganizeConnectorContractTests(unittest.TestCase):
             '`mode: "sql"`',
             "sole `data_source_urls` entry",
             "Run exactly one bounded query",
-            "Bind the single parameter to `__YES__`",
+            '`data.params: ["__YES__"]`',
+            "Do not send `data.parameters`",
             "`10` is the bounded read ceiling",
             "Do not filter empty takeaway/improvement rows",
             "pending-cleanup eligibility handles them",
@@ -50,7 +51,8 @@ class OrganizeConnectorContractTests(unittest.TestCase):
             '"<improvement_property>"',
         ):
             self.assertIn(projected, sql_block)
-        self.assertIn("do not select the configured\n   category/project relation", self.real_read)
+        normalized_read = " ".join(self.real_read.split())
+        self.assertIn("do not select the configured category/project relation", normalized_read)
         self.assertIn("multi-data-source capability", self.real_read)
         self.assertIn("`plan_required`", self.real_read)
         self.assertIn("multiple statements", self.real_read)
