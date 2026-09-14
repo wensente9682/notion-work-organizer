@@ -273,7 +273,7 @@ For `organize todo-test`:
 5. Include only rows whose text `category` matches an available test archive table.
 6. Exclude rows already in an effective `moved` + not-`undone` ledger state.
 7. Present at most the configured `batch_size` move candidates. Empty cleanup candidates do not count toward this size.
-8. Persist the active batch, plus session `batch_size` and `move_limit`, as local state before accepting `ok`, `dismiss`, or `skip`. Snapshot source row URLs/ids, category, a short `name_hint`, and a content fingerprint in local backup/state.
+8. Persist the active batch, plus session `batch_size` and `move_limit`, as local state before accepting `ok`, `dismiss`, or `skip`. Snapshot source row URLs/ids, category, a short `name_hint`, and the SHA-256 content fingerprint under the exact `content_fingerprint` key in local backup/state. If an active candidate backup lacks `content_fingerprint`, treat the snapshot as incomplete and refuse `ok` before any Notion write; never bypass or reconstruct the missing approval snapshot.
 9. If empty checked rows were handled while selecting the batch, show a compact ordered-cleanup summary before the candidate list. In real mode, describe them as proposed cleanup only.
 
 If the user adds new rows to `to-do-test` while an active batch is waiting, do not re-rank or replace that batch. New rows may appear only in a later `next` batch after the current batch is resolved.
@@ -340,7 +340,7 @@ Next: say next, save, or done to finish early
 On `ok N`:
 
 1. Use the snapshotted active batch only. `N` refers to the displayed batch index, not the row's current position in Notion.
-2. Re-read the source row and compare `Name`, `category`, `收获`, and `改进` to the batch fingerprint. If changed, stop and ask the user to approve refreshing the batch.
+2. Require the approved candidate's saved `content_fingerprint`, re-read the source row, and compare `Name`, `category`, `收获`, and `改进` to that fingerprint. If the fingerprint is missing, refuse the operation before any Notion write. If the content changed, stop and ask the user to approve refreshing the batch.
 3. Compute `operation_id` from `session_id`, source row id, and batch number. Check local state for that `operation_id` and source row before creating anything; in test mode also check the ledger.
 4. If the same `operation_id` or source row is already effectively moved and not undone, skip it as a duplicate and report that no archive copy was created.
 5. Check the matching category archive table for a strict manual match using current `Name`, `收获`, and `改进`. If found, record local `manual-match`; in test mode also create a `manual-match` ledger row. Do not create a duplicate archive row.

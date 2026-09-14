@@ -764,6 +764,193 @@ class RealModePreviewTest(unittest.TestCase):
     def write_json(self, path, data):
         workflow.save_json(path, data)
 
+    def test_active_batch_backup_includes_content_fingerprint_for_ok_recheck(self):
+        candidate = workflow.Candidate.from_notion_page(page(SOURCE_ID, SOURCE_DB))
+        state = {
+            "backup_session_id": "session-1",
+            "batch_id": 3,
+            "batch": [candidate.to_state()],
+        }
+
+        with patch.object(workflow, "run_backup") as run_backup:
+            workflow.backup_active_batch(state)
+
+        payload = run_backup.call_args.kwargs["input_json"]
+        self.assertEqual(
+            payload["content_fingerprint"], workflow.candidate_fingerprint(candidate)
+        )
+
+    def test_candidate_state_round_trips_content_fingerprint(self):
+        candidate = workflow.Candidate.from_notion_page(page(SOURCE_ID, SOURCE_DB))
+        persisted = candidate.to_state()
+
+        restored = workflow.Candidate.from_state(persisted)
+
+        self.assertEqual(
+            restored.content_fingerprint, workflow.candidate_fingerprint(candidate)
+        )
+
+    def test_real_ok_rejects_missing_or_invalid_content_fingerprint_before_client_use(self):
+        candidate = workflow.Candidate.from_notion_page(page(SOURCE_ID, SOURCE_DB))
+        for fingerprint in (None, "not-a-sha256"):
+            with self.subTest(fingerprint=fingerprint), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                config_path = tmp_path / "real_profile.json"
+                state_path = tmp_path / "state.json"
+                state_candidate = candidate.to_state()
+                if fingerprint is None:
+                    state_candidate.pop("content_fingerprint")
+                else:
+                    state_candidate["content_fingerprint"] = fingerprint
+                self.write_json(config_path, real_config())
+                self.write_json(
+                    state_path,
+                    {
+                        "batch": [state_candidate],
+                        "batch_id": 1,
+                        "moved": [],
+                        "skipped": [],
+                        "backup_session_id": "session-1",
+                    },
+                )
+                args = argparse.Namespace(
+                    config=config_path,
+                    state=state_path,
+                    items=["1", "to", "research"],
+                    real_write_confirm=None,
+                )
+
+                with (
+                    patch.object(workflow, "get_client") as get_client,
+                    self.assertRaises(workflow.WorkflowError),
+                ):
+                    workflow.command_ok(args)
+
+                get_client.assert_not_called()
+
+    def test_real_next_then_ok_uses_persisted_content_fingerprint(self):
+        source = real_status_source_row(
+            SOURCE_ID,
+            name="previewed item",
+            category="research",
+            learnings="reusable note",
+        )
+
+        class FlowClient(FakeClient):
+            def __init__(self):
+                super().__init__([])
+                self.archive_tables_content = archive_tables_content()
+
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                if database_id == SOURCE_DB:
+                    return {"results": [source], "has_more": False}
+                return {"results": [], "has_more": False}
+
+            def retrieve_page(self, page_id):
+                if workflow.notion_id(page_id) == SOURCE_ID:
+                    return source
+                return super().retrieve_page(page_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "real_profile.json"
+            state_path = tmp_path / "state.json"
+            self.write_json(config_path, real_status_config())
+            self.write_json(state_path, {"batch": [], "moved": [], "skipped": []})
+            client = FlowClient()
+            next_args = argparse.Namespace(
+                config=config_path,
+                state=state_path,
+                batch_size=5,
+                move_limit=None,
+                force=False,
+            )
+
+            with (
+                patch.object(workflow, "preflight"),
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "run_backup", return_value="session-1"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_next(next_args)
+
+            staged = workflow.load_json(state_path, {})
+            self.assertRegex(staged["batch"][0]["content_fingerprint"], r"^[0-9a-f]{64}$")
+            ok_args = argparse.Namespace(
+                config=config_path,
+                state=state_path,
+                items=["1"],
+                real_write_confirm=None,
+            )
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "run_backup", return_value="session-1"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_ok(ok_args)
+
+        self.assertEqual(1, len(client.created_archive_rows))
+        self.assertEqual(RESEARCH_ARCHIVE_DB, client.created_archive_rows[0][0])
+
+    def test_real_ok_rejects_changed_content_before_archive_or_manual_match(self):
+        approved = real_status_source_row(
+            SOURCE_ID,
+            name="approved item",
+            category="research",
+            learnings="approved note",
+        )
+        changed = real_status_source_row(
+            SOURCE_ID,
+            name="changed after preview",
+            category="research",
+            learnings="approved note",
+        )
+
+        class ChangedClient(FakeClient):
+            def __init__(self):
+                super().__init__([])
+                self.archive_queries = []
+
+            def retrieve_page(self, page_id):
+                return changed
+
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                self.archive_queries.append(database_id)
+                return {"results": [], "has_more": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "real_profile.json"
+            state_path = tmp_path / "state.json"
+            self.write_json(config_path, real_status_config())
+            self.write_json(
+                state_path,
+                {
+                    "batch": [workflow.real_candidate_from_notion_page(approved, real_status_config()).to_state()],
+                    "batch_id": 1,
+                    "moved": [],
+                    "skipped": [],
+                    "backup_session_id": "session-1",
+                },
+            )
+            client = ChangedClient()
+            args = argparse.Namespace(
+                config=config_path,
+                state=state_path,
+                items=["1"],
+                real_write_confirm=None,
+            )
+
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "run_backup", return_value="session-1"),
+                self.assertRaises(workflow.WorkflowError),
+            ):
+                workflow.command_ok(args)
+
+        self.assertEqual([], client.created_archive_rows)
+        self.assertEqual([], client.archive_queries)
+
     def test_real_next_routes_status_category_by_visible_name(self):
         eligible = real_status_source_row(
             "eligible-status",

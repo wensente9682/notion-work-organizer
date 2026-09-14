@@ -23,6 +23,7 @@ ALLOWED_RECORD_KEYS = {
     "action",
     "batch",
     "category",
+    "content_fingerprint",
     "created_at",
     "ledger_page_id",
     "ledger_url",

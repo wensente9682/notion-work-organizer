@@ -88,6 +88,16 @@ class OrganizeConnectorContractTests(unittest.TestCase):
         positions = [self.real_read.index(step) for step in ordered_steps]
         self.assertEqual(positions, sorted(positions))
 
+    def test_ok_requires_persisted_content_fingerprint_before_any_write(self):
+        for requirement in (
+            "exact `content_fingerprint` key",
+            "snapshot as incomplete",
+            "refuse `ok` before any Notion write",
+            "Require the approved candidate's saved `content_fingerprint`",
+            "If the fingerprint is missing, refuse the operation before any Notion write",
+        ):
+            self.assertIn(requirement, self.contract)
+
 
 if __name__ == "__main__":
     unittest.main()

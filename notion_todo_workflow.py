@@ -120,6 +120,7 @@ class Candidate:
     created_time: str
     last_edited_time: str = ""
     category_options: list[str] | None = None
+    content_fingerprint: str = ""
 
     @classmethod
     def from_notion_page(cls, page: dict[str, Any], config: dict[str, Any] | None = None) -> "Candidate":
@@ -146,7 +147,7 @@ class Candidate:
             "improvements": self.improvements,
             "created_time": self.created_time,
             "last_edited_time": self.last_edited_time,
-            "fingerprint": candidate_fingerprint(self),
+            "content_fingerprint": self.content_fingerprint or candidate_fingerprint(self),
             "category_options": self.category_options or [],
         }
 
@@ -162,6 +163,7 @@ class Candidate:
             created_time=data.get("created_time", ""),
             last_edited_time=data.get("last_edited_time", ""),
             category_options=data.get("category_options") or None,
+            content_fingerprint=data.get("content_fingerprint", ""),
         )
 
 
@@ -481,6 +483,16 @@ def candidate_fingerprint(candidate: Candidate) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def require_content_fingerprint(candidate: Candidate) -> str:
+    fingerprint = candidate.content_fingerprint
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise WorkflowError(
+            "Active batch snapshot is missing a valid content_fingerprint. "
+            "Refresh the preview before approving any write."
+        )
+    return fingerprint
+
+
 def normalize_fingerprint_text(value: str) -> str:
     return (
         str(value)
@@ -785,6 +797,7 @@ def backup_active_batch(state: dict[str, Any]) -> None:
     batch_id = int(state.get("batch_id", 0))
     for number, item in enumerate(state.get("batch", []), start=1):
         candidate = Candidate.from_state(item)
+        content_fingerprint = require_content_fingerprint(candidate)
         run_backup(
             ["add", session_id],
             input_json={
@@ -793,6 +806,7 @@ def backup_active_batch(state: dict[str, Any]) -> None:
                 "batch": batch_id,
                 "number": number,
                 "category": candidate.category,
+                "content_fingerprint": content_fingerprint,
                 "name_hint": candidate.name,
                 "source_page_id": candidate.source_page_id,
                 "source_url": candidate.source_url,
@@ -2006,6 +2020,7 @@ def print_batch_progress_prompt(state: dict[str, Any]) -> None:
 
 
 def fetch_unchanged_candidate(client: NotionClient, snapshot: Candidate, config: dict[str, Any] | None = None) -> Candidate:
+    expected = require_content_fingerprint(snapshot)
     page = client.retrieve_page(snapshot.source_page_id)
     if page.get("archived"):
         raise WorkflowError(f"Source row is archived/missing: {snapshot.source_page_id}")
@@ -2018,9 +2033,8 @@ def fetch_unchanged_candidate(client: NotionClient, snapshot: Candidate, config:
         current = real_candidate_from_notion_page(page, config)
     else:
         current = Candidate.from_notion_page(page, config)
-    expected = snapshot.to_state().get("fingerprint")
     actual = candidate_fingerprint(current)
-    if expected and expected != actual:
+    if expected != actual:
         raise WorkflowError(
             "Source row changed since the batch was shown. Run `next` to refresh before moving: "
             f"[{snapshot.category}] {snapshot.name}"
@@ -2039,6 +2053,7 @@ def selected_real_candidate(candidate: Candidate, selected_categories: list[str]
         created_time=candidate.created_time,
         last_edited_time=candidate.last_edited_time,
         category_options=selected_categories,
+        content_fingerprint=candidate.content_fingerprint,
     )
     return clone
 
@@ -2466,6 +2481,8 @@ def command_ok(args: argparse.Namespace) -> None:
     if not batch:
         raise WorkflowError("No active batch. Run `next` first.")
     selected_items = parse_ok_items(args.items, batch, real_mode=real_mode)
+    for selected_item in selected_items:
+        require_content_fingerprint(batch[int(selected_item["number"]) - 1])
     options = session_options(state, config)
     session_id = ensure_backup_session(state)
     client = get_client()
