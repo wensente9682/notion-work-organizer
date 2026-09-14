@@ -100,6 +100,19 @@ class OrganizeConnectorContractTests(unittest.TestCase):
         ):
             self.assertIn(requirement, self.contract)
 
+    def test_confirm_cleanup_handles_sandboxed_keychain_access_explicitly(self):
+        for requirement in (
+            "must not be treated as evidence that the credential is absent",
+            "Only after `done` -> explicit `confirm`",
+            "connector has re-read and bilaterally verified",
+            "single user-approved sandbox-escalated execution",
+            "existing Keychain credential and the public Notion API",
+            "Keep the token in process memory only; never print, persist, relay, or copy it",
+            "Do not automatically retry",
+            "Do not use this escalation for preview, `ok`, manual-match, archive row creation, `dismiss`, `skip`, `undo`, `done`, or earlier verification",
+        ):
+            self.assertIn(requirement, self.contract)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -440,6 +440,8 @@ For `organize todo`, formal real use is approval-first: `next` may stage the act
 
 Real source cleanup should use the connector when it can archive pages. If the connector cannot expose page `archived: true`, a local fallback/API path may set only the verified source pages to `archived: true` after `done` -> `confirm`. This exception is limited to final source cleanup and must not become the default path for preview, `ok`, manual-match checks, or archive row creation.
 
+A failed or unavailable `security find-generic-password` result from a sandboxed process must not be treated as evidence that the credential is absent. Only after `done` -> explicit `confirm`, and only after the connector has re-read and bilaterally verified each applicable source/target pair (or the source fingerprint for `dismiss`), run the final `archived: true` calls in a single user-approved sandbox-escalated execution that can access the existing Keychain credential and the public Notion API. Keep the token in process memory only; never print, persist, relay, or copy it. Do not automatically retry this execution. If it is unavailable or fails, keep the affected row `pending-removal` or `needs-review` and do not remove it. Do not use this escalation for preview, `ok`, manual-match, archive row creation, `dismiss`, `skip`, `undo`, `done`, or earlier verification.
+
 For the external CLI fallback, `mode = real` may run the formal batch loop only when explicitly configured and approved:
 
 - `preview` remains read-only and never modifies Notion.
