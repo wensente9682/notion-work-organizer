@@ -10,8 +10,7 @@ Organize 帮助你采用、追踪、复盘并维护一套轻量的 Notion 日常
 
 [**选择起始路径 →**](#选择你的起点)
 
-> **产品状态：**v0.3.1 产品开发已完成，两条起始路径均可用：可只读采用已有工作
-> 数据库，或从 blank / dedicated Notion page 新建工作数据库。
+> **产品状态：**v0.4 产品开发已完成，两条起始路径均可用：可只读采用已有工作数据库，或从 blank / dedicated Notion page 新建工作数据库。
 
 <a id="choose-your-starting-path"></a>
 
@@ -102,7 +101,7 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
    Create a new work database on my blank or dedicated Notion page. Suggest Categories and wait for my confirmation.
    ```
 
-4. setup 或 adoption ready 后，先查看月份统计，再整理当月已完成工作：
+4. setup 或 adoption ready 后，可先查看月份统计，再整理当月已完成工作：
 
    ```text
    total 2026-07
@@ -178,13 +177,13 @@ _图中重点展示日常工作与完成后复盘闭环，并未呈现 `total YY
 
 1. 选择 blank 或 dedicated Notion page。
 2. 查看建议的 Category，再接受、删除、改名或新增，并确认当前列表。
-<!-- 3. 查看并批准每一个 exact setup write。Organize 先建立 Daily Work，再创建并验证
+3. 查看并批准每一个 exact setup write。Organize 先建立 Daily Work，再创建并验证
    按 `Work Date DESC` 排序的 Total saved view，然后建立所需的 archive databases、
-   mappings 和 private profile。 -->
-3. 查看并批准每一个 exact setup write。Organize 建立 Daily Work、archive databases、
    mappings 和 private profile。
-<!-- 4. setup complete 后，像正常产品功能一样使用 Total 和 Organize。 -->
-4. setup complete 后可使用 Organize；Total 仍按顶部临时不可用提示冻结。
+<!-- 3. 查看并批准每一个 exact setup write。Organize 建立 Daily Work、archive databases、
+   mappings 和 private profile。 -->
+4. setup complete 后，像正常产品功能一样使用 Total 和 Organize。
+<!-- 4. setup complete 后可使用 Organize；Total 仍按顶部临时不可用提示冻结。 -->
 
 New System setup 不会授权创建 archive records 或清理 source。
 

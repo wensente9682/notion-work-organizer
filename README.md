@@ -3,7 +3,7 @@
 > An approval-first Codex + Notion starter kit for tracking daily work and
 > turning completed tasks into reusable records.
 
-**v0.3.1 PRODUCT DEVELOPMENT COMPLETE**
+**v0.4 PRODUCT DEVELOPMENT COMPLETE**
 
 Organize helps you start with an existing work system or build a focused new
 one, then use Total and Organize to review completed work without losing useful
@@ -43,6 +43,10 @@ The product owns the schema, archive mappings, verified identities, and private
 profile. Normal users do not need database IDs, JSON, mappings, or profile
 files.
 
+Use Organize if you want a lightweight Notion daily-work practice with deliberate
+review after completion. It is not a standalone task manager, GUI, unattended
+workspace manager, or one-click migration tool.
+
 ## Quick Start
 
 Prerequisites: Git, Codex, and access to the Notion connector.
@@ -67,6 +71,8 @@ Prerequisites: Git, Codex, and access to the Notion connector.
 
 3. After adoption or setup completes, use the normal features.
 
+   Total is optional and read-only; run it when you want a monthly snapshot before Organize.
+
    ```text
    total 2026-07
    organize todo
@@ -74,7 +80,7 @@ Prerequisites: Git, Codex, and access to the Notion connector.
 
 ## Core Workflow
 
-`Choose or create → Track daily work → Total → Organize → Preserve reusable records → done → confirm`
+`Choose or create → Track daily work → optional Total → Organize → Preserve reusable records → done → confirm`
 
 <p align="center">
   <img src="assets/readme/total-card.svg" width="600" alt="Total: count completed time in a selected month. Read-only.">
@@ -98,7 +104,7 @@ Prerequisites: Git, Codex, and access to the Notion connector.
   a pre-write recheck, and at most one connector call.
 - A confirmed failure, ambiguous, partial, or unknown outcome stops the flow;
   there is no automatic retry.
-Total is read-only and never grants Organize approval. It is the explicit
+- Total is read-only and never grants Organize approval. It is the explicit
   architectural exception: each run uses the local Python Stage 4 Views API
   wrapper with a user-managed `NOTION_TOKEN` or Keychain entry, under a
   single-use sandbox-external authorization. If that authorization is denied,
@@ -116,8 +122,8 @@ Total is read-only and never grants Organize approval. It is the explicit
 - New System changes only the user-confirmed dedicated system through visible,
   action-by-action approval.
 - Total is a point-in-time calculation, not a saved dashboard or historical
-reporting system.
-Monthly Total is the explicit exception to connector-first operation: it
+  reporting system.
+- Monthly Total is the explicit exception to connector-first operation: it
   uses local Python `run_total.py` and the Stage 4 Views API, not ordinary
   connector or data-source queries. The general Python CLI remains an advanced
   fallback, not the normal user path.
