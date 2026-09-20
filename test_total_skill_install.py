@@ -25,11 +25,11 @@ class TotalSkillInstallTest(unittest.TestCase):
         self.assertIn("single-use sandbox-external authorization", document)
         self.assertIn("must not request or suggest persistent authorization", document)
         self.assertIn("do not fall back to the Notion connector", document)
+        self.assertNotIn("temporarily unavailable", document)
         self.assertIn(
-            "temporarily unavailable because the Notion Views API dependency is unavailable",
+            "Use only `run_total.py` for Monthly Total",
             document,
         )
-        self.assertIn("<!-- Direct Views route retained for recovery:", document)
 
     def run_installer(self, target, *, cwd, home):
         return subprocess.run(

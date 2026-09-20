@@ -1,6 +1,6 @@
 ---
 name: todo-archive-review
-description: Use when the user says "organize todo-test", "organize todo", asks to review/archive/整理 Notion to-do records by category with ok/dismiss/skip/undo approval, or asks to setup/adopt/configure a Notion personal work maintenance system. Supports existing organize workflows plus guarded setup/adopt routing. Monthly Total is temporarily unavailable because its Notion Views API dependency is unavailable.
+description: Use when the user says "total YYYY-MM", "organize todo-test", "organize todo", asks to review/archive/整理 Notion to-do records by category with ok/dismiss/skip/undo approval, or asks to setup/adopt/configure a Notion personal work maintenance system. Supports Monthly Total, existing organize workflows, and guarded setup/adopt routing.
 metadata:
   short-description: Approval-first Notion work maintenance
 ---
@@ -17,10 +17,10 @@ Core principle: reduce mechanical copying while preserving the user's manual rec
 
 Choose exactly one route from the user's request:
 
-- **Monthly total**: use only when the user says `total YYYY-MM`. Validate the month first; valid requests are temporarily unavailable and stop before local config, credentials, or Notion access.
+- **Monthly total**: use only when the user says `total YYYY-MM`. Validate the month before reading local config or calling Notion, then follow the read-only Total route below.
 - **Organize existing workflow**: use when the user says `organize todo-test`, `organize todo`, `next`, `ok`, `dismiss`, `skip`, `undo`, `save`, `done`, `confirm`, `check`, `status`, or asks to review/archive existing Notion to-do records. Before acting, read `references/organize.md`.
 - **Adopt existing Notion list**: use when the user asks to configure, connect, adopt, migrate, inspect, or use an existing Notion to-do list with this system. Before acting, read `references/adopt-existing.md`.
-- **One-profile adoption readiness**: after an approved private adoption profile exists, use this only when the user asks to verify that profile for a specific `YYYY-MM`. Read `references/adopt-existing.md`; Monthly Total is temporarily unavailable, so stop after its unavailable result and do not enter Organize preview through this route.
+- **One-profile adoption readiness**: after an approved private adoption profile exists, use this only when the user asks to verify that profile for a specific `YYYY-MM`. Read `references/adopt-existing.md`; verify Total first, then enter Organize read-only preview with the same frozen profile. Do not carry approval from either step or start a write path.
 - **Setup new system**: use when the user asks to create, initialize, or set up a new Notion personal work/to-do system. Before acting, read `references/setup.md`.
 - **Schema/config/label help**: use when the user asks what fields/config are required, wants to rename Notion labels/properties, or asks how custom labels affect organize. Read `references/schema.md` if present; otherwise use the project-level `docs/schema.md`.
 
@@ -29,9 +29,6 @@ If the request is an organize command and organize-owned local config/state alre
 ## Monthly Total Route
 
 - Accept only `total YYYY-MM`, with a real calendar month in that exact format. Missing or invalid months stop before config, credentials, or Notion access.
-- A valid Monthly Total request is temporarily unavailable because the Notion Views API dependency is unavailable. Stop immediately and fail closed before reading config, credentials, Keychain, or Notion; do not use a connector fallback or retry.
-
-<!-- Direct Views route retained for recovery:
 - Monthly Total is an explicit exception to the connector-first rule. It must use the direct Stage 4 Views API through `run_total.py`, because ordinary connector view/data-source queries do not establish the saved-view ordering, query identity, expiry, `total_count`, complete pagination, duplicate-page detection, or per-page structured-field reads required by this contract. An empty connector response alone does not prove a zero total.
 - Expected use order: run `total YYYY-MM` before using `organize todo` on that month's completed work. `total` is a read-only, point-in-time calculation over completed items still present in the To-do list when called; it does not cache, persist, or save a snapshot. After those items are organized or cleaned up, the workflow does not rely on that month's total again, and rerunning it is not expected to reproduce the earlier result. `total` itself never organizes or cleans up items.
 - Run the installed skill's internal wrapper as `python3 -B <this-skill-directory>/scripts/run_total.py YYYY-MM`. Each run requires single-use sandbox-external authorization to read the user-managed `NOTION_TOKEN` or `codex-notion-token` Keychain entry and make the read-only request. You must not request or suggest persistent authorization for `run_total.py`, its command prefix, or another repository-modifiable script. If authorization is denied, stop; do not fall back to the Notion connector and do not retry. This is an implementation detail; do not present the advanced external organize CLI as the normal user entry.
@@ -40,7 +37,6 @@ If the request is an organize command and organize-owned local config/state alre
 - The adapter must use the stage 4 Views path and remain read-only. Do not use an ordinary database/data-source query, timestamp ordering, fallback ordering, approval, archive, cleanup, backup, or local state writes.
 - Return only category block subtotals in category-name order and the overlapping all-category total. For an empty result, say that no category blocks were recorded and show a zero total.
 - Treat invalid blocks and all config, API, paging, ordering, or field-contract failures as fail closed. Report only the adapter's sanitized error; never reveal item text, page titles, URLs, page IDs, view IDs, tokens, or raw diagnostics.
--->
 
 ## Existing System Mode
 
@@ -68,7 +64,7 @@ If unrelated Notion context is present, ignore it for organize routing. If it mi
 These rules apply across all routes:
 
 - Data preservation is more important than speed or convenience.
-- Use Codex's Notion connector tools for normal Codex Setup, Adopt, and Organize operation. Monthly Total is temporarily unavailable; never ask the user to paste or store a private Notion API token in chat or repo files.
+- Use Codex's Notion connector tools for normal Setup, Adopt, and Organize operation. Monthly Total is the documented direct Views API exception. Never ask the user to paste or store a private Notion API token in chat or repo files.
 - Do not write tokens, real database IDs, real Notion URLs, private configs, backups, cache, or local state into public docs, examples, committed files, or chat-derived artifacts.
 - Keep this skill namespaced to organize-owned state. Do not change or claim unrelated Notion/vibe coding workflows.
 - Do not modify, create, archive, or delete Notion rows/pages unless the active route explicitly allows it and the user has given the required approval.
@@ -95,7 +91,7 @@ These rules apply across all routes:
 ## CLI Fallback Boundary
 
 - `notion_todo_workflow.py` is developer-facing core plus an advanced-user external CLI fallback.
-- In Codex, use the Notion connector route for active features. Do not run the general CLI or `run_total.py` for Notion reads/writes while Monthly Total is unavailable.
+- In Codex, use the Notion connector route for Setup, Adopt, and Organize. Use only `run_total.py` for Monthly Total; do not substitute the general CLI or connector-native queries.
 - The CLI is useful for regression testing, local debugging, and outside-Codex operation.
 - The CLI may use user-managed shell/Keychain credentials outside Codex, but credentials must never be written into repo config, examples, docs, local state, backup files, or chat-derived artifacts.
 - Ordinary users should not need to understand or run the Python file when using this skill in Codex.

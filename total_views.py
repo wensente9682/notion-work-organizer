@@ -496,6 +496,21 @@ def _total_from_view(
     budget: _TotalScanBudget,
 ) -> TotalResult:
     budget.check_time()
+    if isinstance(api, NotionViewsApi) and fields.category_relations:
+        relation_page_id = next(iter(fields.category_relations))
+        try:
+            relation_page = api.retrieve_page(relation_page_id)
+        except _TotalResourceLimit:
+            raise
+        except Exception as exc:
+            raise TotalViewError("category relation access failed") from exc
+        if (
+            not isinstance(relation_page, dict)
+            or relation_page.get("object") != "page"
+            or relation_page.get("id") != relation_page_id
+        ):
+            raise TotalViewError("category relation access failed")
+        budget.check_time()
     try:
         response = api.create_view_query(view_id, page_size=100)
     except _TotalResourceLimit:

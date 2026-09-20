@@ -2680,6 +2680,34 @@ class TotalFromViewTest(unittest.TestCase):
                 fields=fields_without_mapping,
             )
 
+    def test_concrete_relation_mapping_checks_relation_access_before_view_query(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(
+                request.full_url, 404, "not found", None, None
+            )
+
+        fields = TotalViewFields(
+            done="Done",
+            categories="Category",
+            timeboxing="Blocks",
+            date_anchor="Day",
+            category_relations={"project-a": "Research"},
+        )
+        with self.assertRaisesRegex(TotalViewError, "category relation access"):
+            total_from_view(
+                NotionViewsApi("token-example", opener=opener),
+                view_id="view-example",
+                target_month=date(2026, 7, 1),
+                fields=fields,
+            )
+
+        self.assertEqual(
+            ["https://api.notion.com/v1/pages/project-a"], calls
+        )
+
     def test_truncated_relation_category_fails_closed(self):
         fields = TotalViewFields(
             done="Done",
