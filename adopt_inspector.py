@@ -112,6 +112,23 @@ def _snapshot_problem(snapshot: Any) -> str | None:
     return None
 
 
+def _identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if len(value) == 36:
+        if any(value[index] != "-" for index in (8, 13, 18, 23)):
+            return None
+        compact = value.replace("-", "")
+    elif len(value) == 32:
+        compact = value
+    else:
+        return None
+    compact = compact.lower()
+    if any(char not in "0123456789abcdef" for char in compact):
+        return None
+    return compact
+
+
 def _opaque_bindings_digest(profile: Any) -> str | None:
     if not isinstance(profile, Mapping):
         return None
@@ -165,6 +182,7 @@ def _failed_report() -> AdoptionReport:
         "category.routing",
         "archive.payload",
         "view.access",
+        "view.source",
         "view.order",
         "total.done",
         "total.category",
@@ -183,7 +201,14 @@ def _failed_report() -> AdoptionReport:
 
 
 def inspect_existing_system(reader: Any, request: AdoptionRequest) -> AdoptionReport:
-    """Inspect structural compatibility without writing or returning private values."""
+    """Inspect read-only reader snapshots with verified source and view ownership.
+
+    Snapshot ``database_id`` and ``data_source_id`` keys must come from the objects
+    actually read. The reader must verify the saved view's ownership relationship;
+    it must not copy identities from the request or another object. Database and
+    data source are distinct identities. Missing, ambiguous, or unverifiable values
+    fail closed. These internal keys do not prescribe raw connector response fields.
+    """
     if not _profile_matches_request(request):
         return _failed_report()
     bindings_digest = _opaque_bindings_digest(request.profile)
@@ -284,6 +309,23 @@ def inspect_existing_system(reader: Any, request: AdoptionRequest) -> AdoptionRe
         checks.append(_check("view.access", INCOMPATIBLE, "restore read access to the configured view"))
     else:
         checks.append(_check("view.access", READY, "no action"))
+    source_database = _identity(source.get("database_id"))
+    source_data_source = _identity(source.get("data_source_id"))
+    view_database = _identity(view.get("database_id"))
+    view_data_source = _identity(view.get("data_source_id"))
+    if (
+        source_database is None
+        or source_data_source is None
+        or source_database != _identity(request.source)
+        or source_database == source_data_source
+        or view_database != source_database
+        or view_data_source != source_data_source
+    ):
+        checks.append(
+            _check("view.source", INCOMPATIBLE, "verify the configured view belongs to the inspected source")
+        )
+    else:
+        checks.append(_check("view.source", READY, "no action"))
     if view.get("saved_order_verified") is not True:
         checks.append(_check("view.order", INCOMPATIBLE, "provide a verifiably ordered configured view"))
     else:

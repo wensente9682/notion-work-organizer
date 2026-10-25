@@ -49,6 +49,8 @@ def ready_source():
     return {
         "complete": True,
         "ambiguous": False,
+        "database_id": "11111111111111111111111111111111",
+        "data_source_id": "22222222222222222222222222222222",
         "properties": {
             "Work": {"type": "title"},
             "Complete": {"type": "checkbox"},
@@ -80,6 +82,8 @@ def ready_view():
     return {
         "complete": True,
         "ambiguous": False,
+        "database_id": "11111111111111111111111111111111",
+        "data_source_id": "22222222222222222222222222222222",
         "accessible": True,
         "saved_order_verified": True,
         "date_anchors_verified": True,
@@ -89,7 +93,7 @@ def ready_view():
 def inspected_profile():
     return {
         "mode": "real",
-        "source_database_id": "source-reference",
+        "source_database_id": "11111111111111111111111111111111",
         "archive_tables_page_id": "archive-container-reference",
         "field_mapping": SOURCE_FIELDS,
         "archive_tables": {"research": "research"},
@@ -127,7 +131,7 @@ class AdoptInspectorTests(unittest.TestCase):
         self.assertEqual({"ready"}, {check.status for check in report.checks})
         self.assertEqual(
             [
-                ("source", "source-reference"),
+                ("source", "11111111111111111111111111111111"),
                 ("archive", "research"),
                 ("view", "ordered-view-reference"),
             ],
@@ -159,6 +163,49 @@ class AdoptInspectorTests(unittest.TestCase):
         self.assertEqual("incompatible", by_code["source.category"].status)
         self.assertEqual("incompatible", by_code["total.category"].status)
         self.assertEqual("incompatible", by_code["view.order"].status)
+
+    def test_total_view_must_match_inspected_database_and_data_source(self):
+        for field, value in (
+            ("database_id", "33333333333333333333333333333333"),
+            ("data_source_id", "44444444444444444444444444444444"),
+            ("database_id", None),
+            ("data_source_id", "invalid-id"),
+        ):
+            with self.subTest(field=field, value=value):
+                view = ready_view()
+                if value is None:
+                    view.pop(field)
+                else:
+                    view[field] = value
+                report = inspect_existing_system(FakeReader(view=view), request())
+                checks = {check.code: check for check in report.checks}
+                self.assertEqual("not-ready", report.status)
+                self.assertEqual("incompatible", checks["view.source"].status)
+
+    def test_source_and_view_identity_accept_equivalent_uuid_formats(self):
+        source = ready_source()
+        source["database_id"] = "11111111-1111-1111-1111-111111111111"
+        view = ready_view()
+        view["database_id"] = "11111111111111111111111111111111"
+        view["data_source_id"] = "22222222-2222-2222-2222-222222222222"
+
+        report = inspect_existing_system(FakeReader(source=source, view=view), request())
+
+        self.assertEqual("ready", report.status)
+
+    def test_source_identity_must_match_profile_and_keep_database_distinct(self):
+        for source_change in (
+            {"database_id": "33333333333333333333333333333333"},
+            {"database_id": "invalid-id"},
+            {"data_source_id": "11111111111111111111111111111111"},
+        ):
+            with self.subTest(source_change=source_change):
+                source = ready_source()
+                source.update(source_change)
+                report = inspect_existing_system(FakeReader(source=source), request())
+                checks = {check.code: check for check in report.checks}
+                self.assertEqual("not-ready", report.status)
+                self.assertEqual("incompatible", checks["view.source"].status)
 
     def test_inaccessible_or_incomplete_reads_are_sanitized_and_fail_closed(self):
         for reader in (
@@ -242,7 +289,7 @@ class AdoptInspectorTests(unittest.TestCase):
         self.assertEqual({"incompatible"}, {check.status for check in report.checks})
         self.assertEqual(
             [
-                ("source", "source-reference"),
+                ("source", "11111111111111111111111111111111"),
                 ("archive", "research"),
             ],
             reader.calls,

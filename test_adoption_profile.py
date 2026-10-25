@@ -15,6 +15,7 @@ from adoption_profile import (
 from test_adopt_inspector import (
     FakeReader,
     ready_source,
+    ready_view,
     request as inspector_request,
 )
 
@@ -38,7 +39,7 @@ def partial_report(profile=None):
 def private_profile():
     return {
         "mode": "real",
-        "source_database_id": "source-reference",
+        "source_database_id": "11111111111111111111111111111111",
         "archive_tables_page_id": "archive-container-reference",
         "field_mapping": {
             "task": "Work",
@@ -78,6 +79,33 @@ def evidence_for(
 
 
 class AdoptionProfileTests(unittest.TestCase):
+    def test_partial_evidence_cannot_accept_missing_or_mismatched_view_identity(self):
+        profile = private_profile()
+        for field, value in (
+            ("data_source_id", "33333333333333333333333333333333"),
+            ("database_id", None),
+        ):
+            with self.subTest(field=field, value=value):
+                view = ready_view()
+                if value is None:
+                    view.pop(field)
+                else:
+                    view[field] = value
+                report = inspect_existing_system(
+                    FakeReader(source=ready_source(), view=view),
+                    inspector_request(profile),
+                )
+                self.assertEqual("not-ready", report.status)
+                for accept_partial in (False, True):
+                    with self.subTest(accept_partial=accept_partial):
+                        with self.assertRaises(ProfileError):
+                            freeze_inspection_evidence(
+                                report,
+                                profile,
+                                inspected_at=90,
+                                accept_partial=accept_partial,
+                            )
+
     def test_inspector_report_cannot_be_rebound_to_another_valid_profile(self):
         report = inspect_existing_system(FakeReader(), inspector_request())
         first = private_profile()
@@ -314,7 +342,7 @@ class AdoptionProfileTests(unittest.TestCase):
                 now=lambda: 101,
             )
             saved = json.loads(destination.read_text(encoding="utf-8"))
-            self.assertEqual("source-reference", saved["source_database_id"])
+            self.assertEqual("11111111111111111111111111111111", saved["source_database_id"])
             with self.assertRaises(ProfileError):
                 persist_approved_adoption_profile(
                     proposal,
