@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -192,6 +193,17 @@ class FakeClient:
             return page(compact, WRITING_ARCHIVE_DB)
         return page(compact, "unexpected-database")
 
+    def retrieve_database(self, database_id):
+        sources = [
+            {"id": target.data_source_id}
+            for target in workflow.archive_table_targets(getattr(self, "archive_tables_content", ""))
+            if workflow.notion_id(target.database_id) == workflow.notion_id(database_id)
+        ]
+        return {"object": "database", "id": database_id, "data_sources": sources}
+
+    def retrieve_database_identity(self, database_id):
+        return self.retrieve_database(database_id)
+
     def archive_page(self, page_id):
         self.archive_calls.append(page_id)
         return {"id": page_id}
@@ -224,6 +236,138 @@ class FakeClient:
     def update_ledger_stability(self, page_id, stability):
         self.ledger_updates.append((page_id, stability))
         return {"id": page_id}
+
+
+class PageScopeTest(unittest.TestCase):
+    def test_explicit_pair_requires_parent_or_metadata_proof_of_both_identities(self):
+        database_id = "11111111111111111111111111111111"
+        data_source_id = "22222222222222222222222222222222"
+        database_parent = {"parent": {"type": "database_id", "database_id": database_id}}
+        data_source_parent = {"parent": {"type": "data_source_id", "data_source_id": data_source_id}}
+        metadata = {"object": "database", "id": database_id, "data_sources": [{"id": data_source_id}]}
+
+        self.assertFalse(workflow.page_in_scope(database_parent, database_id, data_source_id))
+        self.assertFalse(workflow.page_in_scope(data_source_parent, database_id, data_source_id))
+        self.assertTrue(workflow.page_in_scope(database_parent, database_id, data_source_id, metadata))
+        self.assertTrue(workflow.page_in_scope(data_source_parent, database_id, data_source_id, metadata))
+        self.assertFalse(workflow.page_in_scope(data_source_parent, "33333333333333333333333333333333", data_source_id, metadata))
+        self.assertFalse(workflow.page_in_scope(data_source_parent, database_id, data_source_id, {**metadata, "data_sources": []}))
+
+    def test_database_only_parent_rejects_multiple_database_sources(self):
+        database_id = "11111111111111111111111111111111"
+        data_source_id = "22222222222222222222222222222222"
+        page = {"parent": {"type": "database_id", "database_id": database_id}}
+        metadata = {
+            "object": "database",
+            "id": database_id,
+            "data_sources": [{"id": data_source_id}, {"id": "33333333333333333333333333333333"}],
+        }
+
+        self.assertFalse(workflow.page_in_scope(page, database_id, data_source_id, metadata))
+
+    def test_data_source_only_parent_accepts_complete_metadata_with_multiple_sources(self):
+        database_id = "11111111111111111111111111111111"
+        data_source_id = "22222222222222222222222222222222"
+        page = {"parent": {"type": "data_source_id", "data_source_id": data_source_id}}
+        metadata = {
+            "object": "database",
+            "id": database_id,
+            "data_sources": [{"id": data_source_id}, {"id": "33333333333333333333333333333333"}],
+        }
+
+        self.assertTrue(workflow.page_in_scope(page, database_id, data_source_id, metadata))
+
+    def test_source_scope_preserves_connector_id_and_requires_a_complete_matching_pair(self):
+        source = {"parent": {"type": "data_source_id", "data_source_id": "22222222222222222222222222222222"}}
+        config_pair = {
+            "source_database_id": "22222222-2222-2222-2222-222222222222",
+            "source_database_owner_id": "11111111111111111111111111111111",
+            "source_data_source_id": "22222222222222222222222222222222",
+        }
+        self.assertEqual(
+            ("11111111111111111111111111111111", "22222222222222222222222222222222"),
+            workflow.source_page_scope(config_pair),
+        )
+        metadata = {"object": "database", "id": config_pair["source_database_owner_id"], "data_sources": [{"id": config_pair["source_data_source_id"]}]}
+        self.assertTrue(workflow.page_in_scope(source, *workflow.source_page_scope(config_pair), database_metadata=metadata))
+        self.assertEqual((SOURCE_DB, None), workflow.source_page_scope({"source_database_id": SOURCE_DB}))
+        for incomplete in (
+            {"source_database_id": config_pair["source_database_id"], "source_data_source_id": config_pair["source_data_source_id"]},
+            {**config_pair, "source_data_source_id": "33333333333333333333333333333333"},
+        ):
+            scope = workflow.source_page_scope(incomplete)
+            self.assertFalse(workflow.page_in_scope(source, *scope))
+
+    def test_verify_page_scope_matches_typed_database_and_data_source_identities(self):
+        class Client:
+            def __init__(self, result):
+                self.result = result
+
+            def retrieve_page(self, _page_id):
+                return self.result
+
+            def retrieve_database_identity(self, database_id):
+                return {"object": "database", "id": database_id, "data_sources": [{"id": "22222222222222222222222222222222"}]}
+
+        source = {
+            "archived": False,
+            "parent": {
+                "type": "data_source_id",
+                "data_source_id": "22222222-2222-2222-2222-222222222222",
+            },
+        }
+        self.assertIs(
+            source,
+            workflow.verify_page_scope(
+                Client(source),
+                "page-id",
+                "11111111111111111111111111111111",
+                "Source",
+                data_source_id="22222222222222222222222222222222",
+            ),
+        )
+
+        database = {
+            "archived": False,
+            "parent": {"type": "database_id", "database_id": "11111111-1111-1111-1111-111111111111"},
+        }
+        self.assertIs(
+            database,
+            workflow.verify_page_scope(
+                Client(database), "page-id", "11111111111111111111111111111111", "Target"
+            ),
+        )
+
+    def test_verify_page_scope_rejects_wrong_missing_and_conflicting_identity_evidence(self):
+        class Client:
+            def __init__(self, result):
+                self.result = result
+
+            def retrieve_page(self, _page_id):
+                return self.result
+
+        parent_cases = (
+            {"type": "data_source_id", "data_source_id": "33333333333333333333333333333333"},
+            {"type": "data_source_id", "data_source_id": "22222222222222222222222222222222", "database_id": "33333333333333333333333333333333"},
+            {"type": "database_id", "database_id": "22222222222222222222222222222222"},
+            {"type": "database_id", "database_id": "11111111111111111111111111111111", "data_source_id": "33333333333333333333333333333333"},
+            {"type": "data_source_id"},
+            {"type": "unknown", "data_source_id": "22222222222222222222222222222222"},
+        )
+        for parent in parent_cases:
+            with self.subTest(parent=parent), self.assertRaises(workflow.WorkflowError):
+                workflow.verify_page_scope(
+                    Client({"archived": False, "parent": parent}),
+                    "page-id",
+                    "11111111111111111111111111111111",
+                    "Source",
+                    data_source_id="22222222222222222222222222222222",
+                )
+        with self.assertRaises(workflow.WorkflowError):
+            workflow.verify_page_scope(
+                Client({"archived": False, "parent": {"type": "data_source_id", "data_source_id": "22222222222222222222222222222222"}}),
+                "page-id", "11111111111111111111111111111111", "Source",
+            )
 
 
 def config():
@@ -492,6 +636,35 @@ class CandidateTimestampDisplayTest(unittest.TestCase):
 
 
 class CacheAndCooldownTest(unittest.TestCase):
+    def test_database_identity_read_uses_new_version_without_changing_default_requests(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self.body).encode()
+
+        client = workflow.NotionClient("test-token")
+        identity = {"object": "database", "id": SOURCE_DB, "data_sources": [{"id": "source-ds"}]}
+        with patch("urllib.request.urlopen", side_effect=[Response(identity), Response({"id": SOURCE_ID})]) as urlopen_mock:
+            self.assertEqual(identity, client.retrieve_database_identity(SOURCE_DB))
+            self.assertEqual({"id": SOURCE_ID}, client.retrieve_page(SOURCE_ID))
+
+        identity_request, page_request = [call.args[0] for call in urlopen_mock.call_args_list]
+        self.assertEqual("https://api.notion.com/v1/databases/SRC_DB", identity_request.full_url)
+        self.assertEqual("GET", identity_request.method)
+        self.assertEqual("2025-09-03", identity_request.get_header("Notion-version"))
+        self.assertEqual("2022-06-28", page_request.get_header("Notion-version"))
+        with self.assertRaises(workflow.WorkflowError):
+            client.request("POST", "/pages", {}, api_version=workflow.DATABASE_IDENTITY_VERSION)
+        self.assertEqual(2, urlopen_mock.call_count)
+
     def test_rate_limit_cooldown_blocks_without_calling_urlopen(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "cache.json"
@@ -2169,6 +2342,76 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(client.archive_calls, [TARGET_ID])
         self.assertEqual(updated["moved"], [])
         self.assertEqual(len(updated["undone"]), 1)
+
+    def test_real_undo_does_not_archive_cross_scope_target(self):
+        class CrossScopeTargetClient(FakeClient):
+            def retrieve_page(self, page_id):
+                compact = workflow.notion_id(page_id)
+                if compact == SOURCE_ID:
+                    return page(SOURCE_ID, SOURCE_DB)
+                if compact == TARGET_ID:
+                    return page(TARGET_ID, "WRONG_ARCHIVE_DB")
+                return page(compact, "unexpected-database")
+
+            def retrieve_archive_tables_content(self, _page_id):
+                return (
+                    '<details><summary>alpha</summary>'
+                    f'<database url="https://example.invalid/notion/{TARGET_DB}" inline="true" '
+                    'data-source-url="collection://TARGET_DS">alpha</database></details>'
+                )
+
+        client = CrossScopeTargetClient([])
+        config_data = real_config()
+        config_data["archive_tables"]["alpha"] = "alpha"
+        state = {"batch_id": 1, "batch": [{}], "moved": [moved_record(target_id=TARGET_ID)]}
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "real_profile.json"
+            state_path = Path(tmp) / "state.json"
+            self.write_json(config_path, config_data)
+            self.write_json(state_path, state)
+            args = argparse.Namespace(config=config_path, state=state_path, items=["1"])
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                with self.assertRaises(workflow.WorkflowError):
+                    workflow.command_undo(args)
+
+        self.assertEqual(client.archive_calls, [])
+
+    def test_real_undo_accepts_metadata_proven_target_scope_without_content_recheck(self):
+        class ValidTargetClient(FakeClient):
+            def retrieve_page(self, page_id):
+                compact = workflow.notion_id(page_id)
+                if compact == SOURCE_ID:
+                    return page(SOURCE_ID, SOURCE_DB)
+                if compact == TARGET_ID:
+                    target = page(TARGET_ID, TARGET_DB)
+                    target["properties"]["Name"] = {"type": "title", "title": [{"plain_text": "changed archive content"}]}
+                    return target
+                return page(compact, "unexpected-database")
+
+            def retrieve_database_identity(self, database_id):
+                return {"object": "database", "id": database_id, "data_sources": [{"id": "TARGET_DS"}]}
+
+            def retrieve_archive_tables_content(self, _page_id):
+                return (
+                    '<details><summary>alpha</summary>'
+                    f'<database url="https://example.invalid/notion/{TARGET_DB}" inline="true" '
+                    'data-source-url="collection://TARGET_DS">alpha</database></details>'
+                )
+
+        client = ValidTargetClient([])
+        config_data = real_config()
+        config_data["archive_tables"]["alpha"] = "alpha"
+        state = {"batch_id": 1, "batch": [{}], "moved": [moved_record(target_id=TARGET_ID)]}
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "real_profile.json"
+            state_path = Path(tmp) / "state.json"
+            self.write_json(config_path, config_data)
+            self.write_json(state_path, state)
+            args = argparse.Namespace(config=config_path, state=state_path, items=["1"])
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_undo(args)
+
+        self.assertEqual(client.archive_calls, [TARGET_ID])
 
     def test_ok_can_reapply_same_batch_number_after_undo(self):
         source_candidate = workflow.Candidate.from_notion_page(page(SOURCE_ID, SOURCE_DB))

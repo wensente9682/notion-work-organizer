@@ -39,6 +39,7 @@ from typing import Any
 
 
 NOTION_VERSION = "2022-06-28"
+DATABASE_IDENTITY_VERSION = "2025-09-03"
 DEFAULT_STATE = ".todo_archive/state.json"
 DEFAULT_CACHE = ".todo_archive/cache.json"
 REAL_MODE = "real"
@@ -225,7 +226,19 @@ class NotionClient:
         self.source_order = source_order
         self.cache_path = cache_path
 
-    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        api_version: str = NOTION_VERSION,
+    ) -> dict[str, Any]:
+        if api_version not in {NOTION_VERSION, DATABASE_IDENTITY_VERSION} or (
+            api_version == DATABASE_IDENTITY_VERSION
+            and not (method == "GET" and path.startswith("/databases/") and path.count("/") == 2)
+        ):
+            raise WorkflowError("Unsupported Notion API version for this request.")
         ensure_notion_cooldown_clear(self.cache_path, mode="api")
         data = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
@@ -234,7 +247,7 @@ class NotionClient:
             method=method,
             headers={
                 "Authorization": f"Bearer {self.token}",
-                "Notion-Version": NOTION_VERSION,
+                "Notion-Version": api_version,
                 "Content-Type": "application/json",
             },
         )
@@ -263,6 +276,11 @@ class NotionClient:
 
     def retrieve_database(self, database_id: str) -> dict[str, Any]:
         return self.request("GET", f"/databases/{database_id}")
+
+    def retrieve_database_identity(self, database_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET", f"/databases/{database_id}", api_version=DATABASE_IDENTITY_VERSION
+        )
 
     def retrieve_page(self, page_id: str) -> dict[str, Any]:
         return self.request("GET", f"/pages/{page_id}")
@@ -578,6 +596,8 @@ def save_cache(cache: dict[str, Any], path: Path = Path(DEFAULT_CACHE)) -> None:
 def config_signature(config: dict[str, Any]) -> str:
     relevant = {
         "source_database_id": config.get("source_database_id"),
+        "source_database_owner_id": config.get("source_database_owner_id"),
+        "source_data_source_id": config.get("source_data_source_id"),
         "ledger_database_id": config.get("ledger_database_id"),
         "target_databases": config.get("target_databases", {}),
         "archive_tables_page_id": config.get("archive_tables_page_id"),
@@ -1194,11 +1214,108 @@ def create_real_archive_table_row(
     return created
 
 
-def page_database_id(page: dict[str, Any]) -> str:
-    parent = page.get("parent", {})
-    if parent.get("type") == "database_id":
-        return notion_id(parent.get("database_id", ""))
-    return ""
+def scope_id_key(value: str) -> str:
+    return notion_id(value).casefold()
+
+
+def source_page_scope(config: dict[str, Any]) -> tuple[str, str | None]:
+    source_id = config.get("source_database_id")
+    owner_id = config.get("source_database_owner_id")
+    data_source_id = config.get("source_data_source_id")
+    if owner_id is None and data_source_id is None:
+        return (str(source_id or ""), None)
+    if (
+        not owner_id
+        or not data_source_id
+        or scope_id_key(str(source_id or "")) != scope_id_key(str(data_source_id))
+    ):
+        return ("", None)
+    return (str(owner_id), str(data_source_id))
+
+
+def page_in_scope(
+    page: dict[str, Any],
+    database_id: str,
+    data_source_id: str | None = None,
+    database_metadata: dict[str, Any] | None = None,
+) -> bool:
+    parent = page.get("parent")
+    if not isinstance(parent, dict):
+        return False
+    expected_database = scope_id_key(database_id)
+    expected_data_source = scope_id_key(data_source_id) if data_source_id else ""
+    if not expected_database or expected_database == expected_data_source:
+        return False
+    parent_type = parent.get("type")
+    actual_database = parent.get("database_id")
+    actual_data_source = parent.get("data_source_id")
+    actual_database_key = scope_id_key(str(actual_database)) if actual_database else ""
+    actual_data_source_key = scope_id_key(str(actual_data_source)) if actual_data_source else ""
+    if not expected_data_source:
+        return parent_type == "database_id" and actual_database_key == expected_database and not actual_data_source
+    both_ids_match = actual_database_key == expected_database and actual_data_source_key == expected_data_source
+    if both_ids_match:
+        return parent_type in {"database_id", "data_source_id"}
+    metadata_sources = database_metadata.get("data_sources") if isinstance(database_metadata, dict) else None
+    metadata_source_ids = [
+        scope_id_key(item["id"])
+        for item in metadata_sources
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ] if isinstance(metadata_sources, list) else []
+    metadata_sources_complete = (
+        isinstance(metadata_sources, list)
+        and not database_metadata.get("has_more")
+        and not database_metadata.get("next_cursor")
+        and len(metadata_source_ids) == len(metadata_sources)
+        and len(set(metadata_source_ids)) == len(metadata_source_ids)
+    )
+    metadata_proves_pair = (
+        isinstance(database_metadata, dict)
+        and database_metadata.get("object") == "database"
+        and scope_id_key(str(database_metadata.get("id", ""))) == expected_database
+        and metadata_sources_complete
+        and metadata_source_ids.count(expected_data_source) == 1
+    )
+    if parent_type == "database_id":
+        return actual_database_key == expected_database and (
+            actual_data_source_key == expected_data_source
+            if actual_data_source
+            else metadata_proves_pair and len(metadata_source_ids) == 1
+        )
+    if parent_type == "data_source_id":
+        return actual_data_source_key == expected_data_source and (
+            actual_database_key == expected_database if actual_database else metadata_proves_pair
+        )
+    return False
+
+
+def page_scope_is_verified(
+    client: NotionClient,
+    page: dict[str, Any],
+    database_id: str,
+    data_source_id: str | None = None,
+) -> bool:
+    if page_in_scope(page, database_id, data_source_id):
+        return True
+    if not data_source_id:
+        return False
+    parent = page.get("parent")
+    if not isinstance(parent, dict):
+        return False
+    parent_type = parent.get("type")
+    missing_partner = (
+        parent_type == "database_id" and not parent.get("data_source_id")
+    ) or (parent_type == "data_source_id" and not parent.get("database_id"))
+    if not missing_partner:
+        return False
+    retrieve_database_identity = getattr(client, "retrieve_database_identity", None)
+    if not callable(retrieve_database_identity):
+        return False
+    try:
+        metadata = retrieve_database_identity(notion_id(database_id))
+    except WorkflowError as exc:
+        raise WorkflowError("Could not verify page scope from database metadata.") from exc
+    return page_in_scope(page, database_id, data_source_id, metadata)
 
 
 def read_keychain_token() -> str:
@@ -1647,13 +1764,18 @@ def matching_ledger_move(
     raise WorkflowError("Moved record does not match an effective Notion ledger row.")
 
 
-def verify_page_scope(client: NotionClient, page_id: str, database_id: str, label: str) -> dict[str, Any]:
+def verify_page_scope(
+    client: NotionClient,
+    page_id: str,
+    database_id: str,
+    label: str,
+    *,
+    data_source_id: str | None = None,
+) -> dict[str, Any]:
     page = client.retrieve_page(page_id)
     if page.get("archived"):
         raise WorkflowError(f"{label} page is already archived: {page_id}")
-    expected = notion_id(database_id)
-    actual = page_database_id(page)
-    if actual != expected:
+    if not page_scope_is_verified(client, page, database_id, data_source_id):
         raise WorkflowError(f"{label} page is outside the expected database: {page_id}")
     return page
 
@@ -1683,7 +1805,11 @@ def verify_moved_record_for_destructive_action(
     else:
         move = matching_ledger_move(config, client, record, allowed_actions=allowed_actions)
     category = record.get("category", "")
-    source_page = verify_page_scope(client, record["source_page_id"], config["source_database_id"], "Source")
+    source_database_id, source_data_source_id = source_page_scope(config)
+    source_page = verify_page_scope(
+        client, record["source_page_id"], source_database_id, "Source",
+        data_source_id=source_data_source_id,
+    )
     done_field = field_name(config, "done")
     if require_source_completed and not read_checkbox(source_page.get("properties", {}).get(done_field, {})):
         raise WorkflowError(
@@ -1691,6 +1817,11 @@ def verify_moved_record_for_destructive_action(
             f"Review `{done_field}` before removing: {record.get('source_url') or record.get('source_page_id')}"
         )
     if config_mode(config) == REAL_MODE:
+        target = real_archive_table_target(config, client, category)
+        target_page = verify_page_scope(
+            client, record["target_page_id"], target.database_id, "Target",
+            data_source_id=target.data_source_id,
+        )
         if require_target_content_current:
             source_candidate = real_candidate_from_notion_page(source_page, config)
             if category not in (source_candidate.category_options or [source_candidate.category]):
@@ -1699,8 +1830,6 @@ def verify_moved_record_for_destructive_action(
                     f"Review before removing: {record.get('source_url') or record.get('source_page_id')}"
                 )
             target_candidate = selected_real_candidate(source_candidate, [category])
-            target = real_archive_table_target(config, client, category)
-            target_page = verify_page_scope(client, record["target_page_id"], target.database_id, "Target")
             if not page_content_matches_candidate(target_page, target_candidate, config):
                 raise WorkflowError(
                     "Final source removal stopped: current source content is not saved in the target archive database row. "
@@ -1731,7 +1860,11 @@ def verify_dismissed_record_for_source_removal(
     client: NotionClient,
     record: dict[str, Any],
 ) -> None:
-    source_page = verify_page_scope(client, record["source_page_id"], config["source_database_id"], "Source")
+    source_database_id, source_data_source_id = source_page_scope(config)
+    source_page = verify_page_scope(
+        client, record["source_page_id"], source_database_id, "Source",
+        data_source_id=source_data_source_id,
+    )
     props = source_page.get("properties", {})
     done_field = field_name(config, "done")
     if not read_checkbox(props.get(done_field, {})):
@@ -1759,7 +1892,11 @@ def verify_dismissed_record_for_source_removal(
 def verify_empty_cleanup_record_for_source_removal(
     config: dict[str, Any], client: NotionClient, record: dict[str, Any]
 ) -> None:
-    source_page = verify_page_scope(client, record["source_page_id"], config["source_database_id"], "Source")
+    source_database_id, source_data_source_id = source_page_scope(config)
+    source_page = verify_page_scope(
+        client, record["source_page_id"], source_database_id, "Source",
+        data_source_id=source_data_source_id,
+    )
     current = empty_checked_candidate(source_page, config)
     if current is None or record.get("fingerprint") != candidate_fingerprint(current):
         raise WorkflowError(
@@ -1783,8 +1920,8 @@ def record_from_ledger_pending_move(
     source_page = client.retrieve_page(source_page_id)
     if source_page.get("archived"):
         return None
-    expected_source_database_id = notion_id(config["source_database_id"])
-    if page_database_id(source_page) != expected_source_database_id:
+    source_database_id, source_data_source_id = source_page_scope(config)
+    if not page_scope_is_verified(client, source_page, source_database_id, source_data_source_id):
         raise WorkflowError(f"Source page is outside the expected database: {source_page_id}")
     fields = field_mapping(config)
     if not read_checkbox(source_page.get("properties", {}).get(fields["done"], {})):
