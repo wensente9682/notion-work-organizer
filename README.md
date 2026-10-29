@@ -3,11 +3,12 @@
 > An approval-first Codex + Notion starter kit for tracking daily work and
 > turning completed tasks into reusable records.
 
-**v0.4 PRODUCT DEVELOPMENT COMPLETE**
+**v0.5 PRODUCT DEVELOPMENT COMPLETE**
 
 Organize helps you start with an existing work system or build a focused new
 one, then use Total and Organize to review completed work without losing useful
-takeaways.
+takeaways. Skipped candidates become eligible again when a new batch is
+generated after 24 hours.
 
 <!--
 > **Temporary availability notice:** Monthly Total is temporarily unavailable

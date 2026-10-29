@@ -10,7 +10,7 @@ Organize 帮助你采用、追踪、复盘并维护一套轻量的 Notion 日常
 
 [**选择起始路径 →**](#选择你的起点)
 
-> **产品状态：**v0.4 产品开发已完成，两条起始路径均可用：可只读采用已有工作数据库，或从 blank / dedicated Notion page 新建工作数据库。
+> **产品状态：**v0.5 产品开发已完成，两条起始路径均可用：可只读采用已有工作数据库，或从 blank / dedicated Notion page 新建工作数据库。skip 满 24 小时后，会在生成新批次时恢复候选资格。
 
 <a id="choose-your-starting-path"></a>
 

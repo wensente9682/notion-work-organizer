@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -523,6 +524,100 @@ class PrivateJsonPermissionsTest(unittest.TestCase):
 
 
 class AutoContinueActiveBatchTest(unittest.TestCase):
+    def test_legacy_string_skip_keeps_its_restored_active_batch_handled(self):
+        state = {
+            "batch_id": 8,
+            "batch": [{"source_page_id": "abc123"}],
+            "skipped": ["abc123"],
+        }
+
+        self.assertEqual(workflow.effective_handled_batch_numbers(state), {1})
+        self.assertTrue(workflow.batch_complete(state))
+
+    def test_legacy_skip_blocks_ok_in_restored_batch_but_new_batch_can_be_approved(self):
+        candidate = workflow.Candidate.from_notion_page(source_row(SOURCE_ID, name="legacy skipped", learnings="x"))
+
+        class SourceClient(FakeClient):
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                if database_id == SOURCE_DB:
+                    return {"results": [source_row(SOURCE_ID, name="legacy skipped", learnings="x")], "has_more": False}
+                return {"results": [], "has_more": False}
+
+            def retrieve_page(self, page_id):
+                return source_row(SOURCE_ID, name="legacy skipped", learnings="x")
+
+            def create_ledger_row(self, database_id, **kwargs):
+                return {"id": "ledger-page-id", "url": "https://example.invalid/notion/ledger-page-id"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            workflow.save_json(config_path, config())
+            workflow.save_json(
+                state_path,
+                {
+                    "batch_id": 7,
+                    "batch": [candidate.to_state()],
+                    "session_id": "session-1",
+                    "backup_session_id": "session-1",
+                    "skipped": [SOURCE_ID],
+                },
+            )
+            client = SourceClient([])
+            active_args = argparse.Namespace(config=config_path, state=state_path, items=["1"], real_write_confirm=None)
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "backup_record"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_ok(active_args)
+            self.assertEqual(client.created_archive_rows, [])
+            workflow.save_json(
+                state_path,
+                {
+                    "batch_id": 7,
+                    "batch": [candidate.to_state()],
+                    "session_id": "session-1",
+                    "backup_session_id": "session-1",
+                    "skipped": [SOURCE_ID],
+                },
+            )
+            next_args = argparse.Namespace(config=config_path, state=state_path, batch_size=5, move_limit=None, force=True)
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "preflight"),
+                patch.object(workflow, "run_backup"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_next(next_args)
+            refreshed = workflow.load_json(state_path, {})
+            self.assertEqual(refreshed["batch_id"], 8)
+            self.assertEqual([item["source_page_id"] for item in refreshed["batch"]], [SOURCE_ID])
+            self.assertEqual(refreshed["skipped"], [SOURCE_ID])
+            self.assertEqual(workflow.skipped_batch_numbers(refreshed), set())
+            history_snapshot = json.loads(json.dumps(refreshed["skipped"]))
+            association_snapshot = json.loads(json.dumps(refreshed["legacy_skip_batch_associations"]))
+            with (
+                patch.object(workflow, "run_backup", side_effect=["", "saved-session"]),
+                patch.object(workflow, "backup_active_batch"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_save(argparse.Namespace(state=state_path))
+            refreshed = workflow.load_json(state_path, {})
+            self.assertEqual(refreshed["skipped"], history_snapshot)
+            self.assertEqual(refreshed["legacy_skip_batch_associations"], association_snapshot)
+
+            ok_args = argparse.Namespace(config=config_path, state=state_path, items=["1"], real_write_confirm=None)
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "backup_record"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_ok(ok_args)
+
+        self.assertEqual(len(client.created_archive_rows), 1)
+
     def test_next_reuses_active_batch_without_config_or_notion(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -561,6 +656,54 @@ class AutoContinueActiveBatchTest(unittest.TestCase):
             self.assertIn("last edited: 2026-07-03 04:05", rendered)
             self.assertIn("ok 1 3", rendered)
             self.assertIn("dismiss 1", rendered)
+
+    def test_expired_skip_does_not_change_handling_of_the_active_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            state = {
+                "batch_id": 7,
+                "batch": [
+                    {"source_page_id": "abc123", "name": "skipped active item", "category": "alpha", "learnings": "x", "improvements": ""},
+                    {"source_page_id": "def456", "name": "unhandled active item", "category": "alpha", "learnings": "y", "improvements": ""},
+                ],
+                "moved": [],
+                "skipped": [{"batch_id": 7, "batch_number": 1, "operation_id": "skip-op", "source_page_id": "abc123", "skipped_at": "2026-09-01T00:00:00Z"}],
+            }
+            workflow.save_json(state_path, state)
+            args = argparse.Namespace(config=root / "missing-config.json", state=state_path, limit=5, force=False)
+            output = io.StringIO()
+
+            with patch.object(workflow, "make_batch") as make_batch, contextlib.redirect_stdout(output):
+                workflow.command_next(args)
+
+            self.assertEqual(workflow.load_json(state_path, {}), state)
+            make_batch.assert_not_called()
+            self.assertIn("batch id: 7", output.getvalue())
+            self.assertIn("skipped: 1", output.getvalue())
+
+    def test_save_preserves_skip_timestamp_and_active_batch_without_retiming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            skipped = {"batch_id": 6, "batch_number": 1, "source_page_id": "abc123", "skipped_at": "2026-09-01T00:00:00Z"}
+            batch = [{"source_page_id": "abc123", "name": "active item"}]
+            state = {"batch_id": 6, "batch": batch, "skipped": [skipped], "backup_session_id": "old-session", "session_id": "old-session"}
+            workflow.save_json(state_path, state)
+            args = argparse.Namespace(state=state_path)
+
+            with (
+                patch.object(workflow, "run_backup", side_effect=["", "new-session"]),
+                patch.object(workflow, "backup_active_batch"),
+                patch.object(workflow, "utc_now", create=True, side_effect=AssertionError("save must not reset skip time")),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_save(args)
+
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(updated["batch_id"], 6)
+        self.assertEqual(updated["batch"], batch)
+        self.assertEqual(updated["skipped"], [skipped])
 
     def test_next_resume_uses_configured_field_labels_when_config_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -762,6 +905,144 @@ class CacheAndCooldownTest(unittest.TestCase):
 
 
 class BatchSelectionTest(unittest.TestCase):
+    def test_reappeared_candidate_approval_gets_new_operation_id_after_old_skip(self):
+        source = source_row(SOURCE_ID, name="reappeared", learnings="learned")
+        candidate = workflow.Candidate.from_notion_page(source)
+        base_operation = workflow.operation_id("session-1", SOURCE_ID, 1)
+
+        class SourceClient(FakeClient):
+            def retrieve_page(self, page_id):
+                if workflow.notion_id(page_id) == SOURCE_ID:
+                    return source
+                return super().retrieve_page(page_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            approval_config = config()
+            approval_config.pop("ledger_database_id")
+            workflow.save_json(config_path, approval_config)
+            workflow.save_json(
+                state_path,
+                {
+                    "batch_id": 2,
+                    "batch": [candidate.to_state()],
+                    "session_id": "session-1",
+                    "backup_session_id": "session-1",
+                    "moved": [],
+                    "skipped": [{
+                        "batch_id": 1,
+                        "batch_number": 1,
+                        "operation_id": base_operation,
+                        "session_id": "session-1",
+                        "source_page_id": SOURCE_ID,
+                        "skipped_at": "2026-01-01T00:00:00Z",
+                    }],
+                },
+            )
+            client = SourceClient([])
+            args = argparse.Namespace(config=config_path, state=state_path, items=["1"], real_write_confirm=None)
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"), contextlib.redirect_stdout(io.StringIO()):
+                workflow.command_ok(args)
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(len(client.created_archive_rows), 1)
+        self.assertEqual(updated["moved"][0]["operation_id"], f"{base_operation}-r1")
+        self.assertEqual(client.archive_calls, [])
+
+    def make_batch_with_skip_state(self, rows, state, now):
+        class SourceClient(FakeClient):
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                if database_id == LEDGER_DB:
+                    return {"results": [], "has_more": False}
+                if database_id == SOURCE_DB:
+                    return {"results": rows, "has_more": False}
+                return {"results": [], "has_more": False}
+
+        client = SourceClient([])
+        with (
+            patch.object(workflow, "get_client", return_value=client),
+            patch.object(workflow, "backup_record"),
+            patch.object(workflow, "utc_now", create=True, return_value=now) as clock,
+        ):
+            batch = workflow.make_batch(config(), state, 20)
+        return batch, clock
+
+    def test_skip_expiry_uses_utc_boundary_and_one_shared_now(self):
+        now = datetime(2026, 2, 1, 12, tzinfo=timezone.utc)
+        rows = [
+            source_row("still-skipped", name="still skipped", learnings="x"),
+            source_row("boundary-expired", name="boundary expired", learnings="x"),
+        ]
+        state = {
+            "batch_id": 4,
+            "session_id": "session-1",
+            "backup_session_id": "session-1",
+            "moved": [],
+            "skipped": [
+                {"source_page_id": "still-skipped", "skipped_at": "2026-01-31T12:00:01Z"},
+                {"source_page_id": "boundary-expired", "skipped_at": "2026-01-31T07:00:00-05:00"},
+            ],
+        }
+
+        batch, clock = self.make_batch_with_skip_state(rows, state, now)
+
+        self.assertEqual([candidate.source_page_id for candidate in batch], ["boundary-expired"])
+        clock.assert_called_once_with()
+        self.assertEqual(state["batch_id"], 4)
+        self.assertEqual(state["skipped"][0]["skipped_at"], "2026-01-31T12:00:01Z")
+
+    def test_skip_history_uses_latest_valid_time_and_preserves_legacy_semantics(self):
+        now = datetime(2026, 2, 1, 12, tzinfo=timezone.utc)
+        ids = ["latest-valid", "expired-with-invalid", "old-dict", "old-string", "invalid-only", "future-only", "valid-plus-future", "invalid-then-valid", "overflow-only", "valid-plus-overflow"]
+        rows = [source_row(item, name=item, learnings="x") for item in ids]
+        skipped = [
+            {"source_page_id": "latest-valid", "skipped_at": "2026-02-01T06:00:00Z"},
+            {"source_page_id": "latest-valid", "skipped_at": "2026-01-30T06:00:00Z"},
+            {"source_page_id": "expired-with-invalid", "skipped_at": "2026-01-31T11:00:00Z"},
+            {"source_page_id": "expired-with-invalid", "skipped_at": "2026-02-02T00:00:00Z"},
+            {"source_page_id": "expired-with-invalid", "skipped_at": "not-a-time"},
+            {"source_page_id": "old-dict"},
+            "old-string",
+            {"source_page_id": "invalid-only", "skipped_at": "2026-01-31T12:00:00"},
+            {"source_page_id": "invalid-only", "skipped_at": "not-a-time"},
+            {"source_page_id": "future-only", "skipped_at": "2026-02-02T00:00:00Z"},
+            {"source_page_id": "valid-plus-future", "skipped_at": "2026-02-01T11:00:00Z"},
+            {"source_page_id": "valid-plus-future", "skipped_at": "2026-02-02T00:00:00Z"},
+            {"source_page_id": "invalid-then-valid", "skipped_at": "not-a-time"},
+            {"source_page_id": "invalid-then-valid", "skipped_at": "2026-02-01T11:00:00Z"},
+            {"source_page_id": "overflow-only", "skipped_at": "0001-01-01T00:00:00+01:00"},
+            {"source_page_id": "valid-plus-overflow", "skipped_at": "0001-01-01T00:00:00+01:00"},
+            {"source_page_id": "valid-plus-overflow", "skipped_at": "2026-02-01T11:00:00Z"},
+        ]
+        state = {"batch_id": 2, "session_id": "session-1", "backup_session_id": "session-1", "moved": [], "skipped": skipped}
+
+        batch, _ = self.make_batch_with_skip_state(rows, state, now)
+
+        self.assertEqual(
+            [candidate.source_page_id for candidate in batch],
+            ["expired-with-invalid", "old-dict", "old-string"],
+        )
+        self.assertEqual(state["skipped"], skipped)
+
+    def test_real_preview_applies_skip_expiry_without_mutating_skip_history(self):
+        now = datetime(2026, 2, 1, 12, tzinfo=timezone.utc)
+        row = real_status_source_row("expired-real-skip", name="expired", category="research", learnings="x")
+        class RealClient(FakeClient):
+            def query_database(self, database_id, start_cursor=None, page_size=100):
+                if database_id == SOURCE_DB:
+                    return {"results": [row], "has_more": False}
+                return {"results": [], "has_more": False}
+
+        state = {"batch_id": 3, "skipped": [{"source_page_id": "expired-real-skip", "skipped_at": "2026-01-31T12:00:00Z"}]}
+        snapshot = json.loads(json.dumps(state))
+        with patch.object(workflow, "get_client", return_value=RealClient([])), patch.object(workflow, "utc_now", create=True, return_value=now):
+            batch, _, _ = workflow.make_preview_batch(real_status_config(), state, 5)
+
+        self.assertEqual([candidate.source_page_id for candidate in batch], ["expired-real-skip"])
+        self.assertEqual(state, snapshot)
+
     def test_checked_empty_rows_are_pending_in_order_without_counting_toward_batch(self):
         first_empty = source_row("empty-first", name="empty first")
         eligible = source_row("eligible-one", name="eligible", learnings="learned")
@@ -2089,7 +2370,6 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
     def test_confirm_finalizes_dismissed_source_without_target_or_ledger(self):
         client = FakeClient([])
         state = {"dismissed": [dismissed_record()], "moved": [], "skipped": [], "awaiting_done_confirm": True}
-
         updated = self.run_with_files(client, state, workflow.command_confirm)
 
         self.assertEqual(client.archive_calls, [SOURCE_ID])
@@ -2180,7 +2460,11 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         }
         client = FakeClient([])
 
-        done_state = self.run_with_files(client, {"empty_cleanup": [record]}, workflow.command_done)
+        done_state = self.run_with_files(
+            client,
+            {"empty_cleanup": [record], "skipped": [{"operation_id": "old-skip-op", "source_page_id": SOURCE_ID}]},
+            workflow.command_done,
+        )
         self.assertEqual(client.archive_calls, [])
         self.assertTrue(done_state["awaiting_done_confirm"])
 
@@ -2222,6 +2506,246 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertFalse(updated["awaiting_done_confirm"])
         self.assertEqual(updated["moved"], [])
         self.assertEqual(len(updated["removed"]), 1)
+
+    def test_old_skip_blocks_only_its_operation_not_a_new_same_source_operation(self):
+        old_operation = dict(moved_record(), session_id="old-session", operation_id="old-op", batch_id=1)
+        new_operation = dict(moved_record(), session_id="new-session", operation_id="new-op", batch_id=2)
+        new_ledger = ledger_page(operation_id="new-op")
+        new_ledger["properties"]["session_id"] = rich_text("new-session")
+        new_ledger["properties"]["batch"] = rich_text("2")
+        client = FakeClient([new_ledger])
+        state = {
+            "moved": [old_operation, new_operation],
+            "skipped": [{"operation_id": "old-op", "session_id": "old-session", "batch_id": 1, "batch_number": 1, "source_page_id": SOURCE_ID}],
+            "awaiting_done_confirm": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / ".todo_archive" / "state.json"
+            backup_dir = state_path.parent / "backups"
+            backup_dir.mkdir(parents=True)
+            self.write_json(config_path, config())
+            self.write_json(state_path, state)
+            self.write_json(
+                backup_dir / "new-session.json",
+                {
+                    "session_id": "new-session",
+                    "records": [
+                        {"action": "candidate", "batch": 2, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "moved", "session_id": "new-session", "operation_id": "new-op", "batch": 2, "number": 1, "source_page_id": SOURCE_ID},
+                    ],
+                },
+            )
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.archive_calls, [SOURCE_ID])
+        self.assertEqual([item["operation_id"] for item in updated["removed"]], ["new-op"])
+        self.assertEqual([item["operation_id"] for item in updated["needs_review"]], ["old-op"])
+        self.assertEqual([item["operation_id"] for item in updated["moved"]], ["old-op"])
+
+    def test_source_only_legacy_skip_keeps_unproven_dismiss_cleanup_pending(self):
+        new_dismiss = dict(dismissed_record(), session_id="new-session", operation_id="new-dismiss-op", batch_id=2)
+        state = {
+            "dismissed": [new_dismiss],
+            "moved": [],
+            "skipped": [SOURCE_ID],
+            "awaiting_done_confirm": True,
+        }
+        client = FakeClient([])
+
+        updated = self.run_with_files(client, state, workflow.command_confirm)
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(updated["needs_review"][0]["operation_id"], "new-dismiss-op")
+
+    def test_source_only_legacy_skip_keeps_unproven_cleanup_pending(self):
+        client = FakeClient([ledger_page()])
+        state = {
+            "moved": [moved_record()],
+            "skipped": [SOURCE_ID],
+            "awaiting_done_confirm": True,
+        }
+
+        updated = self.run_with_files(client, state, workflow.command_confirm)
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(updated["needs_review"][0]["operation_id"], "op-1")
+
+    def test_skip_operation_id_conflict_with_another_source_requires_review(self):
+        record = dict(moved_record(), operation_id="shared-op")
+        state = {
+            "moved": [record],
+            "skipped": [{"operation_id": "shared-op", "source_page_id": "different-source"}],
+            "awaiting_done_confirm": True,
+        }
+        client = FakeClient([ledger_page(operation_id="shared-op")])
+
+        updated = self.run_with_files(client, state, workflow.command_confirm)
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(updated["needs_review"][0]["operation_id"], "shared-op")
+
+    def test_conflicting_backup_record_session_cannot_prove_independent_operation(self):
+        record = moved_record()
+        client = FakeClient([ledger_page()])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / ".todo_archive" / "state.json"
+            backup_dir = state_path.parent / "backups"
+            backup_dir.mkdir(parents=True)
+            self.write_json(config_path, config())
+            self.write_json(state_path, {"moved": [record], "skipped": [SOURCE_ID], "awaiting_done_confirm": True})
+            self.write_json(
+                backup_dir / "session-1.json",
+                {
+                    "session_id": "session-1",
+                    "records": [
+                        {"action": "candidate", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "moved", "session_id": "different-session", "operation_id": "op-1", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                    ],
+                },
+            )
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(updated["needs_review"][0]["operation_id"], "op-1")
+
+    def test_legacy_skip_same_operation_stays_protected_with_complete_backup_evidence(self):
+        old_operation = dict(moved_record(), session_id="old-session", operation_id="old-op", batch_id=4, batch_number=1)
+        state = {
+            "moved": [old_operation],
+            "skipped": [{"session_id": "old-session", "batch_id": 4, "batch_number": 1, "source_page_id": SOURCE_ID}],
+            "awaiting_done_confirm": True,
+        }
+        client = FakeClient([ledger_page(operation_id="old-op")])
+        client.ledger_results[0]["properties"]["session_id"] = rich_text("old-session")
+        client.ledger_results[0]["properties"]["batch"] = rich_text("4")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / ".todo_archive" / "state.json"
+            backup_dir = state_path.parent / "backups"
+            backup_dir.mkdir(parents=True)
+            self.write_json(config_path, config())
+            self.write_json(state_path, state)
+            self.write_json(
+                backup_dir / "old-session.json",
+                {
+                    "session_id": "old-session",
+                    "records": [
+                        {"action": "candidate", "batch": 4, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "moved", "session_id": "old-session", "operation_id": "old-op", "batch": 4, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "skipped", "session_id": "old-session", "batch": 4, "number": 1, "source_page_id": SOURCE_ID},
+                    ],
+                },
+            )
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(updated["needs_review"][0]["operation_id"], "old-op")
+
+    def test_legacy_string_skip_association_with_skipped_backup_protects_same_operation(self):
+        record = moved_record()
+        state = {
+            "moved": [record],
+            "skipped": [SOURCE_ID],
+            "legacy_skip_batch_associations": [
+                {"batch_id": 1, "batch_number": 1, "source_page_id": SOURCE_ID}
+            ],
+            "awaiting_done_confirm": True,
+        }
+        client = FakeClient([ledger_page()])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / ".todo_archive" / "state.json"
+            backup_dir = state_path.parent / "backups"
+            backup_dir.mkdir(parents=True)
+            self.write_json(config_path, config())
+            self.write_json(state_path, state)
+            self.write_json(
+                backup_dir / "session-1.json",
+                {
+                    "session_id": "session-1",
+                    "records": [
+                        {"action": "candidate", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "moved", "session_id": "session-1", "operation_id": "op-1", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "skipped", "session_id": "session-1", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                    ],
+                },
+            )
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(updated["needs_review"][0]["operation_id"], "op-1")
+
+    def test_legacy_skip_uses_backup_operation_evidence_and_keeps_ambiguous_old_cleanup_pending(self):
+        operations = [
+            dict(moved_record(), session_id="session-1", operation_id="old-op-1", batch_id=1),
+            dict(moved_record(), session_id="session-3", operation_id="old-op-3", batch_id=3),
+            dict(moved_record(), session_id="session-2", operation_id="new-op", batch_id=2),
+        ]
+        new_ledger = ledger_page(operation_id="new-op")
+        new_ledger["properties"]["session_id"] = rich_text("session-2")
+        new_ledger["properties"]["batch"] = rich_text("2")
+        client = FakeClient([new_ledger])
+        state = {
+            "moved": operations,
+            "skipped": [
+                {"batch_id": 1, "batch_number": 1, "source_page_id": SOURCE_ID},
+                {"batch_id": 3, "batch_number": 1, "source_page_id": SOURCE_ID},
+            ],
+            "awaiting_done_confirm": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / ".todo_archive" / "state.json"
+            backup_dir = state_path.parent / "backups"
+            backup_dir.mkdir(parents=True)
+            self.write_json(config_path, config())
+            self.write_json(state_path, state)
+            self.write_json(
+                backup_dir / "session-1.json",
+                {
+                    "session_id": "session-1",
+                    "records": [
+                        {"action": "candidate", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "skipped", "batch": 1, "number": 1, "source_page_id": SOURCE_ID},
+                    ],
+                },
+            )
+            self.write_json(
+                backup_dir / "session-2.json",
+                {
+                    "session_id": "session-2",
+                    "records": [
+                        {"action": "candidate", "batch": 2, "number": 1, "source_page_id": SOURCE_ID},
+                        {"action": "moved", "session_id": "session-2", "operation_id": "new-op", "batch": 2, "number": 1, "source_page_id": SOURCE_ID},
+                    ],
+                },
+            )
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.archive_calls, [SOURCE_ID])
+        self.assertEqual([item["operation_id"] for item in updated["removed"]], ["new-op"])
+        self.assertEqual({item["operation_id"] for item in updated["needs_review"]}, {"old-op-1", "old-op-3"})
 
     def test_confirm_does_not_finalize_unchecked_pending_sources(self):
         class UncheckedSourceClient(FakeClient):
@@ -2512,6 +3036,8 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
             with (
                 patch.object(workflow, "ensure_backup_session", return_value="session-1"),
                 patch.object(workflow, "backup_record") as backup_record,
+                patch.object(workflow, "get_client") as get_client,
+                patch.object(workflow, "utc_now", create=True, return_value=datetime(2026, 10, 29, 12, tzinfo=timezone.utc)) as utc_now,
                 contextlib.redirect_stdout(output),
             ):
                 workflow.command_skip(args)
@@ -2520,15 +3046,68 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
 
         self.assertEqual(
             updated["skipped"],
-            [{"batch_id": 4, "batch_number": 1, "source_page_id": SOURCE_ID}],
+            [{
+                "batch_id": 4,
+                "batch_number": 1,
+                "operation_id": workflow.operation_id("session-1", SOURCE_ID, 1),
+                "session_id": "session-1",
+                "source_page_id": SOURCE_ID,
+                "skipped_at": "2026-10-29T12:00:00Z",
+            }],
         )
+        utc_now.assert_called_once_with()
+        get_client.assert_not_called()
         backup_record.assert_called_once()
         backup_payload = backup_record.call_args.args[1]
         self.assertEqual(backup_payload["action"], "skipped")
         self.assertEqual(backup_payload["source_page_id"], SOURCE_ID)
+        self.assertEqual(backup_payload["skipped_at"], "2026-10-29T12:00:00Z")
+        self.assertEqual(backup_payload["operation_id"], workflow.operation_id("session-1", SOURCE_ID, 1))
         self.assertIn("skip 1: [alpha] moved item", output.getvalue())
         self.assertIn("Batch complete.", output.getvalue())
         self.assertIn("Reply `next`", output.getvalue())
+
+    def test_expired_skip_does_not_reopen_an_already_skipped_active_batch_item(self):
+        source = source_row(SOURCE_ID, name="still active", learnings="learned")
+        candidate = workflow.Candidate.from_notion_page(source)
+        class SourceClient(FakeClient):
+            def retrieve_page(self, page_id):
+                if workflow.notion_id(page_id) == SOURCE_ID:
+                    return source
+                return super().retrieve_page(page_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            self.write_json(config_path, config())
+            state = {
+                "batch_id": 4,
+                "batch": [candidate.to_state()],
+                "moved": [],
+                "skipped": [{
+                    "batch_id": 4,
+                    "batch_number": 1,
+                    "operation_id": "skip-op",
+                    "session_id": "session-1",
+                    "source_page_id": SOURCE_ID,
+                    "skipped_at": "2026-10-01T00:00:00Z",
+                }],
+                "backup_session_id": "session-1",
+                "session_id": "session-1",
+            }
+            self.write_json(state_path, state)
+            client = SourceClient([])
+            args = argparse.Namespace(config=config_path, state=state_path, items=["1"], real_write_confirm=None)
+
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"), contextlib.redirect_stdout(io.StringIO()):
+                workflow.command_ok(args)
+
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.created_archive_rows, [])
+        self.assertEqual(updated["moved"], [])
+        self.assertEqual(updated["skipped"][0]["skipped_at"], "2026-10-01T00:00:00Z")
 
     def test_undo_prompts_rehandling_of_undone_item(self):
         client = FakeClient([ledger_page()])

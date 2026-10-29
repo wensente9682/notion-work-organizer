@@ -16,6 +16,36 @@ SPEC.loader.exec_module(backup)
 
 
 class BackupPermissionsTest(unittest.TestCase):
+    def test_cli_persists_skip_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup_dir = Path(tmp) / ".todo_archive" / "backups"
+            begin = subprocess.run(
+                [sys.executable, str(SCRIPT), "--backup-dir", str(backup_dir), "begin", "--label", "todo"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            session_id = begin.stdout.strip()
+            skipped_at = "2026-10-29T12:00:00Z"
+            record = {
+                "action": "skipped",
+                "batch": 4,
+                "number": 1,
+                "operation_id": "operation-1",
+                "source_page_id": "source-1",
+                "skipped_at": skipped_at,
+            }
+
+            subprocess.run(
+                [sys.executable, str(SCRIPT), "--backup-dir", str(backup_dir), "add", session_id, "--record-json", json.dumps(record)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            persisted = backup.load_json(backup_dir / f"{session_id}.json")
+            self.assertEqual(persisted["records"][0]["skipped_at"], skipped_at)
+
     def test_cli_persists_candidate_content_fingerprint_for_ok_recheck(self):
         with tempfile.TemporaryDirectory() as tmp:
             backup_dir = Path(tmp) / ".todo_archive" / "backups"

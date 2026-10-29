@@ -35,6 +35,7 @@ ALLOWED_RECORD_KEYS = {
     "source_page_id",
     "source_url",
     "status",
+    "skipped_at",
     "target_page_id",
     "target_url",
 }

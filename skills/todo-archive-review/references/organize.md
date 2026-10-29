@@ -115,7 +115,7 @@ Source cleanup archives the source page with Notion's recoverable `archived: tru
 - Real preview/next must stay lightweight: do not scan archive databases for manual-match before the user approves an item. Manual-match is checked at `ok` time.
 - `ok 1`, `ok 1 3 5`: move approved items from the active batch.
 - `dismiss 1`: do not create an archive row, but mark the source row as eligible for final source removal after `done` and `confirm`.
-- `skip 2`: skip active batch items.
+- `skip 2`: skip active batch items. A skip excludes that source from newly generated candidate batches for less than 24 hours from its UTC `skipped_at`; exactly 24 hours is expired. Each source and each later skip is timed independently. Expiry never changes the active batch or its handled items, and a reappearing candidate still needs the normal approval flow.
 - `undo 1`: undo a just-moved item by archiving/deleting the created archive copy, or undo a dismissed item by clearing only local pending-removal state. Never change the source item during undo.
 - `check organize todo-test`: run a stability check for the test workflow without changing source rows.
 - `preflight organize todo-test`: verify test schemas and safety fields without moving rows.
@@ -147,7 +147,7 @@ Source cleanup archives the source page with Notion's recoverable `archived: tru
 - In test mode, `done` ends the run but is not final deletion approval. It must show a short summary and ask for confirmation. After the user replies `confirm`, finalize checked pending source rows. The finalize step must still verify source/target/test-ledger scope and `完成` before removing anything.
 - If `confirm` leaves pending rows in `needs-review`, keep the confirmation state active so the user can fix Notion rows and run `confirm` again without restarting the loop.
 - `save` is not an end-of-run command. It preserves prior moves/skips, marks the current backup session as saved, creates a new backup session, snapshots the current active batch into the new session, and then continues. After `save`, later `ok` / `skip` operations use the new `session_id`, so they can be treated as a fresh organize run while still referring to the same snapshotted active batch.
-- `skip` rows are not removal candidates.
+- `skip` rows are not removal candidates. A skip protects only its associated cleanup operation; an older skip does not block an independently approved later operation for the same source. If an old cleanup operation cannot be associated safely, keep it in `needs_review`.
 - `undone` rows are not removal candidates.
 - Only successfully moved/manual-matched and not-undone source rows, plus dismissed and not-undone source rows, are removal candidates.
 - Do not show `undo` in the candidate preview before anything has been moved. Show `undo` only after an archive copy exists.

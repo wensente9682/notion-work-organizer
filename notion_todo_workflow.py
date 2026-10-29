@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any
@@ -560,6 +560,11 @@ def next_operation_id(state: dict[str, Any], session_id: str, source_page_id: st
         for item in state.get("undone", []) + state.get("moved", []) + state.get("manual_matches", []) + state.get("dismissed", [])
         if item.get("operation_id")
     }
+    blocked.update(
+        item["operation_id"]
+        for item in state.get("skipped", [])
+        if isinstance(item, dict) and item.get("operation_id")
+    )
     attempt = 0
     while operation_attempt_id(base, attempt) in blocked:
         attempt += 1
@@ -583,6 +588,10 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
 
 def now_seconds() -> float:
     return time.time()
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def load_cache(path: Path = Path(DEFAULT_CACHE)) -> dict[str, Any]:
@@ -1555,15 +1564,161 @@ def manual_match_source_ids(state: dict[str, Any]) -> set[str]:
     }
 
 
-def skipped_source_ids(state: dict[str, Any]) -> set[str]:
-    source_ids: set[str] = set()
+def skipped_source_ids(state: dict[str, Any], now: datetime) -> set[str]:
+    histories: dict[str, tuple[list[datetime], bool]] = {}
+    now = now.astimezone(timezone.utc)
     for item in state.get("skipped", []):
-        if isinstance(item, dict):
-            if item.get("source_page_id"):
-                source_ids.add(notion_id(item["source_page_id"]))
-        else:
-            source_ids.add(notion_id(item))
-    return source_ids
+        source_id = item.get("source_page_id") if isinstance(item, dict) else item
+        if not source_id:
+            continue
+        source_key = notion_id(str(source_id))
+        valid_times, has_invalid_time = histories.setdefault(source_key, ([], False))
+        value = item.get("skipped_at") if isinstance(item, dict) else None
+        if value is None or value == "":
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else None
+            if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("skip timestamp is not timezone-aware")
+            parsed = parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            histories[source_key] = (valid_times, True)
+            continue
+        if parsed > now:
+            histories[source_key] = (valid_times, True)
+            continue
+        valid_times.append(parsed)
+
+    active: set[str] = set()
+    for source_key, (valid_times, has_invalid_time) in histories.items():
+        if valid_times:
+            if now - max(valid_times) < timedelta(hours=24):
+                active.add(source_key)
+        elif has_invalid_time:
+            active.add(source_key)
+    return active
+
+
+def skip_batch_pointer(record: dict[str, Any]) -> tuple[int, int, str] | None:
+    source_id = record.get("source_page_id")
+    try:
+        batch_id = int(record.get("batch_id", record.get("batch")))
+        batch_number = int(record.get("batch_number", record.get("number")))
+    except (TypeError, ValueError):
+        return None
+    if not source_id or batch_id < 1 or batch_number < 1:
+        return None
+    return batch_id, batch_number, notion_id(str(source_id))
+
+
+def backed_up_operation_evidence(
+    backup_dir: Path,
+) -> tuple[set[tuple[str, str, tuple[int, int, str]]], set[tuple[str, str, tuple[int, int, str]]]]:
+    operations: set[tuple[str, str, tuple[int, int, str]]] = set()
+    skipped_operations: set[tuple[str, str, tuple[int, int, str]]] = set()
+    for path in backup_dir.glob("*.json") if backup_dir.exists() else []:
+        try:
+            backup = load_json(path, {})
+        except (OSError, ValueError):
+            continue
+        if not isinstance(backup, dict):
+            continue
+        session_id = backup.get("session_id")
+        records = backup.get("records")
+        if not session_id or not isinstance(records, list):
+            continue
+        session_id = str(session_id)
+        valid_records = [
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("session_id") in (None, session_id)
+        ]
+        prepared = {skip_batch_pointer(record) for record in valid_records if record.get("action") == "candidate"}
+        skipped = [record for record in valid_records if record.get("action") == "skipped"]
+        for record in valid_records:
+            pointer = skip_batch_pointer(record)
+            operation_id_value = record.get("operation_id")
+            if (
+                record.get("action") in {"moved", "manual-match", "dismissed"}
+                and record.get("session_id") == session_id
+                and operation_id_value
+                and pointer in prepared
+            ):
+                operation = (str(operation_id_value), session_id, pointer)
+                operations.add(operation)
+                if any(
+                    skip_batch_pointer(skip) == pointer
+                    and skip.get("operation_id") in (None, operation_id_value)
+                    for skip in skipped
+                ):
+                    skipped_operations.add(operation)
+    return operations, skipped_operations
+
+
+def skipped_operation_relation(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    backed_up_operations: set[tuple[str, str, tuple[int, int, str]]],
+    backed_up_skipped_operations: set[tuple[str, str, tuple[int, int, str]]],
+) -> str | None:
+    if record.get("_state_bucket") == "empty_cleanup":
+        return None
+    source_id = notion_id(str(record.get("source_page_id", "")))
+    operation_id_value = record.get("operation_id")
+    record_pointer = skip_batch_pointer(record)
+    session_id = record.get("session_id")
+    operation_complete = bool(source_id and operation_id_value and session_id and record_pointer)
+
+    for skipped in state.get("skipped", []):
+        if not isinstance(skipped, dict) or not skipped.get("operation_id") or skipped.get("operation_id") != operation_id_value:
+            continue
+        skipped_source = skipped.get("source_page_id")
+        if not skipped_source or notion_id(str(skipped_source)) != source_id:
+            return "incomplete"
+        skipped_pointer = skip_batch_pointer(skipped)
+        if skipped.get("session_id") and skipped.get("session_id") != session_id:
+            return "incomplete"
+        if skipped_pointer and skipped_pointer != record_pointer:
+            return "incomplete"
+        return "skipped"
+
+    if any(isinstance(item, str) and notion_id(item) == source_id for item in state.get("skipped", [])):
+        for association in state.get("legacy_skip_batch_associations", []):
+            if not isinstance(association, dict) or not association.get("source_page_id"):
+                continue
+            if notion_id(association["source_page_id"]) != source_id:
+                continue
+            association_pointer = skip_batch_pointer(association)
+            if association_pointer and association_pointer == record_pointer:
+                operation = (str(operation_id_value), str(session_id), record_pointer) if operation_complete else None
+                if operation and operation in backed_up_skipped_operations:
+                    return "skipped"
+                return "incomplete"
+            if not association_pointer:
+                try:
+                    association_batch = int(association.get("batch_id", association.get("batch")))
+                except (TypeError, ValueError):
+                    association_batch = None
+                if record_pointer is None or association_batch is None or association_batch == record_pointer[0]:
+                    return "incomplete"
+
+    for skipped in state.get("skipped", []):
+        skipped_source = skipped.get("source_page_id") if isinstance(skipped, dict) else skipped
+        if not skipped_source or notion_id(str(skipped_source)) != source_id:
+            continue
+        skip_pointer = skip_batch_pointer(skipped) if isinstance(skipped, dict) else None
+        skip_session = skipped.get("session_id") if isinstance(skipped, dict) else None
+        if skip_pointer and skip_pointer == record_pointer and skip_session in (None, session_id):
+            return "skipped" if operation_complete else "incomplete"
+        if skip_session and skip_session == session_id and not skip_pointer:
+            return "incomplete"
+        if isinstance(skipped, dict) and skipped.get("operation_id"):
+            if not operation_complete or (operation_id_value, str(session_id), record_pointer) not in backed_up_operations:
+                return "incomplete"
+            continue
+        if not operation_complete or (operation_id_value, str(session_id), record_pointer) not in backed_up_operations:
+            return "incomplete"
+    return None
 
 
 def dismissed_source_ids(state: dict[str, Any]) -> set[str]:
@@ -2070,9 +2225,60 @@ def effective_archive_operation_ids(state: dict[str, Any]) -> set[str]:
     return moved_operation_ids(state) | dismissed_operation_ids(state)
 
 
+def legacy_skipped_batch_numbers(state: dict[str, Any]) -> set[int]:
+    sources = {notion_id(item) for item in state.get("skipped", []) if isinstance(item, str)}
+    associations = state.get("legacy_skip_batch_associations", [])
+    associated_sources = {
+        notion_id(item["source_page_id"])
+        for item in associations
+        if isinstance(item, dict) and item.get("source_page_id")
+    }
+    batch_id = int(state.get("batch_id", 0))
+    handled = {
+        int(item["batch_number"])
+        for item in associations
+        if isinstance(item, dict)
+        and int(item.get("batch_id") or 0) == batch_id
+        and item.get("batch_number")
+        and notion_id(item.get("source_page_id", "")) in sources
+    }
+    handled.update({
+        number
+        for number, item in enumerate(state.get("batch", []), start=1)
+        if item.get("source_page_id")
+        and notion_id(item["source_page_id"]) in sources
+        and notion_id(item["source_page_id"]) not in associated_sources
+    })
+    return handled
+
+
+def record_legacy_skip_batch_associations(state: dict[str, Any]) -> None:
+    batch_id = int(state.get("batch_id", 0))
+    batch_numbers = {
+        notion_id(item["source_page_id"]): number
+        for number, item in enumerate(state.get("batch", []), start=1)
+        if item.get("source_page_id")
+    }
+    associated_sources = {
+        notion_id(item["source_page_id"])
+        for item in state.get("legacy_skip_batch_associations", [])
+        if isinstance(item, dict) and item.get("source_page_id")
+    }
+    for item in state.get("skipped", []):
+        if not isinstance(item, str):
+            continue
+        source_id = notion_id(item)
+        if source_id in associated_sources:
+            continue
+        association = {"batch_id": batch_id, "source_page_id": item}
+        if source_id in batch_numbers:
+            association["batch_number"] = batch_numbers[source_id]
+        state.setdefault("legacy_skip_batch_associations", []).append(association)
+        associated_sources.add(source_id)
+
+
 def effective_handled_batch_numbers(state: dict[str, Any]) -> set[int]:
     batch_id = int(state.get("batch_id", 0))
-    batch = state.get("batch", [])
     handled: set[int] = set()
     records = effective_records(state.get("moved", []) + state.get("manual_matches", []), state)
     for item in records:
@@ -2085,10 +2291,7 @@ def effective_handled_batch_numbers(state: dict[str, Any]) -> set[int]:
         if isinstance(item, dict):
             if int(item.get("batch_id") or 0) == batch_id and item.get("batch_number"):
                 handled.add(int(item["batch_number"]))
-        elif item:
-            for number, batch_item in enumerate(batch, start=1):
-                if notion_id(batch_item.get("source_page_id", "")) == notion_id(str(item)):
-                    handled.add(number)
+    handled.update(legacy_skipped_batch_numbers(state))
     return handled
 
 
@@ -2108,15 +2311,11 @@ def batch_record_by_number(records: list[dict[str, Any]], state: dict[str, Any],
 def skipped_batch_numbers(state: dict[str, Any]) -> set[int]:
     numbers: set[int] = set()
     batch_id = int(state.get("batch_id", 0))
-    batch = state.get("batch", [])
     for item in state.get("skipped", []):
         if isinstance(item, dict):
             if int(item.get("batch_id") or 0) == batch_id and item.get("batch_number"):
                 numbers.add(int(item["batch_number"]))
-        elif item:
-            for number, batch_item in enumerate(batch, start=1):
-                if notion_id(batch_item.get("source_page_id", "")) == notion_id(str(item)):
-                    numbers.add(number)
+    numbers.update(legacy_skipped_batch_numbers(state))
     return numbers
 
 
@@ -2197,13 +2396,14 @@ def selected_real_candidate(candidate: Candidate, selected_categories: list[str]
 
 def make_batch(config: dict[str, Any], state: dict[str, Any], limit: int) -> list[Candidate]:
     client = get_client(config.get("source_order", "bottom_first"))
+    now = utc_now()
     source_id = notion_id(config["source_database_id"])
     target_categories = set(config["target_databases"].keys())
     already_handled = (
         moved_source_ids(state)
         | manual_match_source_ids(state)
         | dismissed_source_ids(state)
-        | skipped_source_ids(state)
+        | skipped_source_ids(state, now)
         | {notion_id(item["source_page_id"]) for item in state.get("empty_cleanup", []) if item.get("source_page_id")}
         | ledger_moved_source_ids(config, client)
     )
@@ -2252,6 +2452,7 @@ def make_batch(config: dict[str, Any], state: dict[str, Any], limit: int) -> lis
 
 def make_preview_batch(config: dict[str, Any], state: dict[str, Any], limit: int) -> tuple[list[Candidate], list[Candidate], list[dict[str, Any]]]:
     client = get_client(config.get("source_order", "bottom_first"))
+    now = utc_now()
     source_id = notion_id(config["source_database_id"])
     if config_mode(config) == REAL_MODE:
         target_categories = set(config.get("archive_tables", {}).keys())
@@ -2261,7 +2462,7 @@ def make_preview_batch(config: dict[str, Any], state: dict[str, Any], limit: int
         moved_source_ids(state)
         | manual_match_source_ids(state)
         | dismissed_source_ids(state)
-        | skipped_source_ids(state)
+        | skipped_source_ids(state, now)
         | ledger_moved_source_ids(config, client)
     )
     candidates: list[Candidate] = []
@@ -2400,6 +2601,7 @@ def command_preview(args: argparse.Namespace) -> None:
     batch, empty_candidates, manual_matches = make_preview_batch(config, state, options["batch_size"])
     print_preview(empty_candidates, manual_matches, batch, real_mode=config_mode(config) == REAL_MODE, config=config)
     if config_mode(config) == REAL_MODE and getattr(args, "stage_real_trial", False):
+        record_legacy_skip_batch_associations(state)
         state["batch"] = [candidate.to_state() for candidate in batch]
         state["batch_id"] = int(state.get("batch_id", 0)) + 1
         state["session_options"] = options
@@ -2455,6 +2657,7 @@ def command_next(args: argparse.Namespace) -> None:
     options = session_options(state, config, args)
     preflight(config)
     ensure_backup_session(state)
+    record_legacy_skip_batch_associations(state)
     state["batch_id"] = int(state.get("batch_id", 0)) + 1
     if config_mode(config) == REAL_MODE:
         batch, empty_candidates, preview_manual_matches = make_preview_batch(config, state, options["batch_size"])
@@ -2634,6 +2837,10 @@ def command_ok(args: argparse.Namespace) -> None:
     for selected_item in selected_items:
         number = int(selected_item["number"])
         selected_categories = list(selected_item.get("selected_categories") or [])
+        if number in skipped_batch_numbers(state):
+            snapshot = batch[number - 1]
+            print(f"ok {number}: already skipped [{snapshot.category}] {snapshot.name}")
+            continue
         if current_count + moved_this_run >= limit:
             print(f"Move limit reached: {current_count + moved_this_run} / {limit}")
             break
@@ -2793,14 +3000,19 @@ def command_skip(args: argparse.Namespace) -> None:
     if not batch:
         raise WorkflowError("No active batch. Run `next` first.")
     selected = parse_numbers(args.items, len(batch))
-    ensure_backup_session(state)
+    session_id = ensure_backup_session(state)
+    skipped_at = utc_now().isoformat(timespec="seconds").replace("+00:00", "Z")
     for number in selected:
         candidate = batch[number - 1]
+        op_id = next_operation_id(state, session_id, candidate.source_page_id, number)
         state.setdefault("skipped", []).append(
             {
                 "batch_id": int(state.get("batch_id", 0)),
                 "batch_number": number,
+                "operation_id": op_id,
+                "session_id": session_id,
                 "source_page_id": candidate.source_page_id,
+                "skipped_at": skipped_at,
             }
         )
         backup_record(
@@ -2809,10 +3021,13 @@ def command_skip(args: argparse.Namespace) -> None:
                 "action": "skipped",
                 "batch": int(state.get("batch_id", 0)),
                 "number": number,
+                "operation_id": op_id,
                 "category": candidate.category,
                 "name_hint": candidate.name,
+                "session_id": session_id,
                 "source_page_id": candidate.source_page_id,
                 "source_url": candidate.source_url,
+                "skipped_at": skipped_at,
             },
         )
         print(f"skip {number}: [{candidate.category}] {candidate.name}")
@@ -2833,7 +3048,7 @@ def command_dismiss(args: argparse.Namespace) -> None:
     current_batch_id = int(state.get("batch_id", 0))
     already_handled = moved_source_ids(state) | manual_match_source_ids(state) | dismissed_source_ids(state)
     already_ops = effective_archive_operation_ids(state)
-    skipped_sources = skipped_source_ids(state)
+    skipped_numbers = skipped_batch_numbers(state)
     for number in selected:
         snapshot = batch[number - 1]
         op_id = next_operation_id(state, session_id, snapshot.source_page_id, number)
@@ -2841,7 +3056,7 @@ def command_dismiss(args: argparse.Namespace) -> None:
         if op_id in already_ops or source_id in already_handled:
             print(f"dismiss {number}: already handled [{snapshot.category}] {snapshot.name}")
             continue
-        if source_id in skipped_sources:
+        if number in skipped_numbers:
             print(f"dismiss {number}: already skipped [{snapshot.category}] {snapshot.name}")
             continue
         candidate = fetch_unchanged_candidate(client, snapshot, config)
@@ -3092,7 +3307,7 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
     attempted_ops = {record.get("operation_id") for record in moved if record.get("operation_id")}
     undone_ops = {record.get("operation_id") for record in state.get("undone", []) if record.get("operation_id")}
     undone_sources = {notion_id(record.get("source_page_id", "")) for record in state.get("undone", []) if record.get("source_page_id")}
-    skipped_sources = {notion_id(record.get("source_page_id", "")) for record in state.get("skipped", []) if record.get("source_page_id")}
+    backed_up_operations, backed_up_skipped_operations = backed_up_operation_evidence(state_path.parent / "backups")
     for record in moved:
         source_page_id = record.get("source_page_id")
         if not source_page_id:
@@ -3114,8 +3329,16 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
             print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
             print("  reason: Final source removal stopped: this record was undone.")
             continue
-        if source_compact in skipped_sources:
-            kept["needs_review"] = "Final source removal stopped: this source row was skipped."
+        skip_relation = skipped_operation_relation(
+            state, record, backed_up_operations, backed_up_skipped_operations
+        )
+        if skip_relation:
+            reason = (
+                "Final source removal stopped: this operation was skipped."
+                if skip_relation == "skipped"
+                else "Final source removal stopped: skip operation association is incomplete."
+            )
+            kept["needs_review"] = reason
             needs_review.append(kept)
             if record.get("_state_bucket") == "manual_matches":
                 remaining_manual_matches.append(kept)
@@ -3126,7 +3349,7 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
             elif record.get("_state_bucket") == "moved":
                 remaining_moved.append(kept)
             print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
-            print("  reason: Final source removal stopped: this source row was skipped.")
+            print(f"  reason: {reason}")
             continue
         try:
             if record.get("_state_bucket") == "empty_cleanup":
