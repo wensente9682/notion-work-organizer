@@ -512,14 +512,28 @@ def require_content_fingerprint(candidate: Candidate) -> str:
 
 
 def normalize_fingerprint_text(value: str) -> str:
-    return (
-        str(value)
-        .replace("⇒", "=>")
-        .replace("→", "->")
-        .replace("←", "<-")
-        .replace("’", "'")
-        .strip()
-    )
+    return str(value).strip()
+
+
+def real_page_body(page: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
+    props = page.get("properties")
+    fields = field_mapping(config)
+    body = {}
+    for key, field, kind in (
+        ("name", fields["task"], "title"),
+        ("learnings", fields["takeaway"], "rich_text"),
+        ("improvements", fields["improvement"], "rich_text"),
+    ):
+        prop = props.get(field) if isinstance(props, dict) else None
+        pieces = prop.get(kind) if isinstance(prop, dict) and prop.get("type") == kind else None
+        if not isinstance(pieces, list) or any(
+            not isinstance(piece, dict) or not isinstance(piece.get("plain_text"), str)
+            for piece in pieces
+        ):
+            raise WorkflowError("Organize body property is missing or malformed.")
+        value = "".join(piece["plain_text"] for piece in pieces)
+        body[key] = value if kind == "title" else value.strip()
+    return body
 
 
 def archive_content(page: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, str]:
@@ -541,6 +555,9 @@ def candidate_content(candidate: Candidate) -> dict[str, str]:
 
 
 def page_content_matches_candidate(page: dict[str, Any], candidate: Candidate, config: dict[str, Any] | None = None) -> bool:
+    if config is not None and config_mode(config) == REAL_MODE:
+        body = real_page_body(page, config)
+        return {key: value.strip() for key, value in body.items()} == candidate_content(candidate)
     return archive_content(page, config) == candidate_content(candidate)
 
 
@@ -1443,13 +1460,14 @@ def real_candidate_from_notion_page(page: dict[str, Any], config: dict[str, Any]
     mapped = set(config.get("archive_tables", {}))
     if not set(category_options).issubset(mapped):
         raise WorkflowError("Category is not mapped to an archive target.")
+    body = real_page_body(page, config)
     return Candidate(
         source_page_id=page["id"],
         source_url=page.get("url", ""),
-        name=read_title(props.get(fields["task"], {})),
+        name=body["name"],
         category=" + ".join(category_options),
-        learnings=read_text(props.get(fields["takeaway"], {})).strip(),
-        improvements=read_text(props.get(fields["improvement"], {})).strip(),
+        learnings=body["learnings"],
+        improvements=body["improvements"],
         created_time=page.get("created_time", ""),
         last_edited_time=page.get("last_edited_time", ""),
         category_options=category_options,
@@ -1482,8 +1500,12 @@ def empty_checked_candidate(page: dict[str, Any], config: dict[str, Any] | None 
     props = page.get("properties", {})
     if not read_checkbox(props.get(field_name(config, "done"), {})):
         return None
-    candidate = Candidate.from_notion_page(page, config)
-    if candidate.learnings or candidate.improvements:
+    candidate = (
+        real_empty_checked_candidate(page, config)
+        if config is not None and config_mode(config) == REAL_MODE
+        else Candidate.from_notion_page(page, config)
+    )
+    if candidate is None or candidate.learnings or candidate.improvements:
         return None
     return candidate
 
@@ -2014,6 +2036,7 @@ def verify_dismissed_record_for_source_removal(
     config: dict[str, Any],
     client: NotionClient,
     record: dict[str, Any],
+    snapshot: Candidate | None = None,
 ) -> None:
     source_database_id, source_data_source_id = source_page_scope(config)
     source_page = verify_page_scope(
@@ -2037,11 +2060,46 @@ def verify_dismissed_record_for_source_removal(
             "Final source removal stopped: dismissed record is missing source content evidence. "
             "Run `inspect` and review before removing source rows."
         )
-    if expected != candidate_fingerprint(current):
+    if snapshot is None and config_mode(config) == REAL_MODE and record.get("fingerprint_version") != 2:
+        raise WorkflowError(
+            "Final source removal stopped: dismissed record has no verifiable strict fingerprint. "
+            "Show the source again and obtain a new dismissal."
+        )
+    if snapshot is not None:
+        snapshot_fingerprint = snapshot.content_fingerprint or candidate_fingerprint(snapshot)
+        unchanged = (
+            expected == candidate_fingerprint(snapshot)
+            and expected == snapshot_fingerprint
+            and candidate_snapshot_matches_current(snapshot, current)
+        )
+    else:
+        unchanged = expected == candidate_fingerprint(current)
+    if not unchanged:
         raise WorkflowError(
             "Final source removal stopped: dismissed source row changed after dismissal. "
             f"Review before removing: {record.get('source_url') or record.get('source_page_id')}"
         )
+
+
+def candidate_snapshot_matches_current(snapshot: Candidate, current: Candidate) -> bool:
+    return (
+        normalize_fingerprint_text(snapshot.name) == normalize_fingerprint_text(current.name)
+        and normalize_fingerprint_text(snapshot.category) == normalize_fingerprint_text(current.category)
+        and snapshot.learnings.strip() == current.learnings.strip()
+        and snapshot.improvements.strip() == current.improvements.strip()
+    )
+
+
+def batch_snapshot_for_record(state: dict[str, Any], record: dict[str, Any]) -> Candidate | None:
+    source_id = notion_id(record.get("source_page_id", ""))
+    batch_number = record.get("batch_number")
+    for item in state.get("batch", []):
+        if notion_id(item.get("source_page_id", "")) != source_id:
+            continue
+        if batch_number is not None and item.get("number") != batch_number:
+            continue
+        return Candidate.from_state(item)
+    return None
 
 
 def verify_empty_cleanup_record_for_source_removal(
@@ -2360,7 +2418,8 @@ def fetch_unchanged_candidate(client: NotionClient, snapshot: Candidate, config:
     page = client.retrieve_page(snapshot.source_page_id)
     if page.get("archived"):
         raise WorkflowError(f"Source row is archived/missing: {snapshot.source_page_id}")
-    if config is not None and config_mode(config) == REAL_MODE:
+    real_mode = config is not None and config_mode(config) == REAL_MODE
+    if real_mode:
         if not read_checkbox(page.get("properties", {}).get(field_name(config, "done"), {})):
             raise WorkflowError(
                 "Source row is no longer checked complete. Run `preview` to refresh before moving: "
@@ -2370,7 +2429,7 @@ def fetch_unchanged_candidate(client: NotionClient, snapshot: Candidate, config:
     else:
         current = Candidate.from_notion_page(page, config)
     actual = candidate_fingerprint(current)
-    if expected != actual:
+    if expected != actual or (real_mode and not candidate_snapshot_matches_current(snapshot, current)):
         raise WorkflowError(
             "Source row changed since the batch was shown. Run `next` to refresh before moving: "
             f"[{snapshot.category}] {snapshot.name}"
@@ -3071,6 +3130,7 @@ def command_dismiss(args: argparse.Namespace) -> None:
             "category": candidate.category,
             "name": candidate.name,
             "fingerprint": candidate_fingerprint(candidate),
+            "fingerprint_version": 2,
         }
         state.setdefault("dismissed", []).append(record)
         backup_record(
@@ -3356,7 +3416,9 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
                 verify_empty_cleanup_record_for_source_removal(config, client, record)
                 ledger_move = LedgerMove("", "", "empty-cleanup", "", "", record.get("source_url", ""), "", record.get("category", ""), int(record.get("batch") or 0), 0)
             elif record.get("_state_bucket") == "dismissed":
-                verify_dismissed_record_for_source_removal(config, client, record)
+                verify_dismissed_record_for_source_removal(
+                    config, client, record, batch_snapshot_for_record(state, record)
+                )
                 ledger_move = LedgerMove(
                     page_id="",
                     page_url="",
@@ -3481,7 +3543,9 @@ def command_check(args: argparse.Namespace) -> None:
     for record in records:
         try:
             if record.get("_kind") == "dismissed":
-                verify_dismissed_record_for_source_removal(config, client, record)
+                verify_dismissed_record_for_source_removal(
+                    config, client, record, batch_snapshot_for_record(state, record)
+                )
             else:
                 verify_moved_record_for_destructive_action(
                     config,

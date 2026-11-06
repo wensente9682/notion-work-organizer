@@ -769,6 +769,23 @@ class CandidateTimestampDisplayTest(unittest.TestCase):
 
         self.assertIn("last edited: unknown", output.getvalue())
 
+    def test_dismiss_evidence_rejects_arrow_changes(self):
+        before = workflow.Candidate(SOURCE_ID, "", "title → next", "alpha", "body → next", "", "")
+        title_changed = workflow.Candidate(SOURCE_ID, "", "title -> next", "alpha", "body → next", "", "")
+        body_changed = workflow.Candidate(SOURCE_ID, "", "title → next", "alpha", "body -> next", "", "")
+        self.assertFalse(workflow.candidate_snapshot_matches_current(before, title_changed))
+        self.assertNotEqual(workflow.candidate_fingerprint(before), workflow.candidate_fingerprint(body_changed))
+
+    def test_real_empty_cleanup_rejects_missing_or_malformed_body(self):
+        for bad in (None, {"type": "rich_text", "rich_text": ""}):
+            row = real_status_source_row(SOURCE_ID, name="empty", category="research")
+            if bad is None:
+                del row["properties"]["改进"]
+            else:
+                row["properties"]["改进"] = bad
+            with self.subTest(bad=bad), self.assertRaises(workflow.WorkflowError):
+                workflow.empty_checked_candidate(row, real_status_config())
+
     def test_last_edited_time_is_not_part_of_content_fingerprint(self):
         row = source_row(SOURCE_ID, name="same content", learnings="same", improvements="same")
         first = workflow.Candidate.from_notion_page(row)
@@ -1288,6 +1305,7 @@ class RealModePreviewTest(unittest.TestCase):
             name="previewed item",
             category="research",
             learnings="reusable note",
+            improvements="1. keep <literal>",
         )
 
         class FlowClient(FakeClient):
@@ -1330,6 +1348,11 @@ class RealModePreviewTest(unittest.TestCase):
 
             staged = workflow.load_json(state_path, {})
             self.assertRegex(staged["batch"][0]["content_fingerprint"], r"^[0-9a-f]{64}$")
+            # The page read may resegment rich text or change its annotations.
+            source["properties"]["改进"]["rich_text"] = [
+                {"plain_text": "1. ", "annotations": {"bold": True}},
+                {"plain_text": "keep <literal>"},
+            ]
             ok_args = argparse.Namespace(
                 config=config_path,
                 state=state_path,
@@ -1345,6 +1368,7 @@ class RealModePreviewTest(unittest.TestCase):
 
         self.assertEqual(1, len(client.created_archive_rows))
         self.assertEqual(RESEARCH_ARCHIVE_DB, client.created_archive_rows[0][0])
+        self.assertEqual(client.created_archive_rows[0][1].improvements, "1. keep <literal>")
 
     def test_real_ok_rejects_changed_content_before_archive_or_manual_match(self):
         approved = real_status_source_row(
@@ -2325,6 +2349,7 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(len(updated["dismissed"]), 1)
         self.assertEqual(updated["dismissed"][0]["source_page_id"], SOURCE_ID)
         self.assertEqual(updated["dismissed"][0]["fingerprint"], workflow.candidate_fingerprint(source_candidate))
+        self.assertEqual(updated["dismissed"][0]["fingerprint_version"], 2)
 
     def test_undo_dismiss_restores_item_without_notion_write(self):
         source_candidate = workflow.Candidate.from_notion_page(page(SOURCE_ID, SOURCE_DB))
@@ -2376,6 +2401,66 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(client.ledger_updates, [])
         self.assertEqual(updated["dismissed"], [])
         self.assertEqual(len(updated["removed"]), 1)
+
+    def test_confirm_rejects_old_rendered_snapshot_when_api_reads_plain_text(self):
+        snapshot = workflow.Candidate(
+            source_page_id=SOURCE_ID,
+            source_url=f"https://example.invalid/notion/{SOURCE_ID}",
+            name="real item",
+            category="research",
+            learnings="<p>\nconsistent with p-bias \n</p>",
+            improvements="",
+            created_time="2026-07-01T00:00:00Z",
+            category_options=["research"],
+        )
+        source = real_source_row(
+            SOURCE_ID,
+            name="real item",
+            categories=[RESEARCH_PROJECT_ID],
+            learnings="consistent with p-bias",
+        )
+
+        class ConnectorSnapshotClient(FakeClient):
+            def retrieve_page(self, page_id):
+                if workflow.notion_id(page_id) == SOURCE_ID:
+                    return source
+                return super().retrieve_page(page_id)
+
+        client = ConnectorSnapshotClient([])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "real_profile.json"
+            state_path = tmp_path / "state.json"
+            record = {
+                **dismissed_record(),
+                "category": "research",
+                "name": "real item",
+                "fingerprint": workflow.candidate_fingerprint(snapshot),
+            }
+            self.write_json(config_path, real_config())
+            self.write_json(
+                state_path,
+                {
+                    "batch": [{**snapshot.to_state(), "number": 1}],
+                    "dismissed": [record],
+                    "moved": [],
+                    "skipped": [],
+                    "awaiting_done_confirm": True,
+                },
+            )
+            args = argparse.Namespace(config=config_path, state=state_path)
+
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "backup_record"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                workflow.command_confirm(args)
+
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertIn("changed after dismissal", updated["needs_review"][0]["needs_review"])
 
     def test_remove_sources_rejects_dismissed_without_done_confirm_path(self):
         client = FakeClient([])
@@ -2472,6 +2557,49 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(client.archive_calls, [SOURCE_ID])
         self.assertEqual(confirmed["empty_cleanup"], [])
         self.assertFalse(confirmed["awaiting_done_confirm"])
+
+    def test_real_confirm_keeps_empty_cleanup_when_body_was_added(self):
+        original = real_status_source_row(SOURCE_ID, name="empty", category="research")
+        changed = real_status_source_row(SOURCE_ID, name="empty", category="research", improvements="new note")
+        candidate = workflow.real_candidate_from_notion_page(original, real_status_config())
+        record = {
+            "session_id": "session-1", "operation_id": "empty-op", "source_page_id": SOURCE_ID,
+            "source_url": candidate.source_url, "fingerprint": workflow.candidate_fingerprint(candidate),
+        }
+
+        class ChangedClient(FakeClient):
+            def retrieve_page(self, page_id):
+                return changed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            state_path = Path(tmp) / "state.json"
+            self.write_json(config_path, real_status_config())
+            self.write_json(state_path, {"empty_cleanup": [record], "awaiting_done_confirm": True})
+            client = ChangedClient([])
+            args = argparse.Namespace(config=config_path, state=state_path)
+            with patch.object(workflow, "get_client", return_value=client), patch.object(workflow, "backup_record"):
+                workflow.command_confirm(args)
+            result = workflow.load_json(state_path, {})
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(len(result["needs_review"]), 1)
+        self.assertTrue(result["awaiting_done_confirm"])
+
+    def test_real_dismiss_without_snapshot_requires_versioned_fingerprint(self):
+        source = real_status_source_row(SOURCE_ID, name="a -> b", category="research", learnings="note")
+        candidate = workflow.real_candidate_from_notion_page(source, real_status_config())
+        record = {"source_page_id": SOURCE_ID, "fingerprint": workflow.candidate_fingerprint(candidate)}
+
+        class SourceClient(FakeClient):
+            def retrieve_page(self, page_id):
+                return source
+
+        client = SourceClient([])
+        with self.assertRaises(workflow.WorkflowError):
+            workflow.verify_dismissed_record_for_source_removal(real_status_config(), client, record)
+        workflow.verify_dismissed_record_for_source_removal(
+            real_status_config(), client, {**record, "fingerprint_version": 2}
+        )
 
     def test_confirm_keeps_changed_empty_cleanup_source(self):
         candidate = workflow.Candidate.from_notion_page(source_row(SOURCE_ID, name="empty item"))

@@ -1,3 +1,6 @@
+import json
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -18,6 +21,51 @@ class OrganizeConnectorContractTests(unittest.TestCase):
         cls.real_read = cls.contract.split(
             "For real-mode connector candidate reads,", 1
         )[1].split("For `organize todo-test`:", 1)[0]
+
+    def test_b19_structured_body_gate(self):
+        helper = ORGANIZE_REFERENCE.parent.parent / "scripts" / "organize_body.py"
+        fields = ["Name", "收获", "改进"]
+        raw = {"Name": "Example", "收获": None, "改进": "1. keep <literal>"}
+        rendered = {"Name": "Example", "收获": "", "改进": "<p>\n  1\\. keep <literal> \n</p>"}
+
+        def run(row, props):
+            return subprocess.run(
+                [sys.executable, "-B", str(helper)],
+                input=json.dumps({"fields": fields, "row": row, "properties": props}),
+                text=True, capture_output=True, check=False,
+            )
+
+        expected = {"Name": "Example", "收获": "", "改进": "1. keep <literal>"}
+        for props in (rendered, expected):
+            result = run(raw, props)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), expected)
+
+        # Literal tags already copied into the archive must not verify as an equal target.
+        for row, props in (
+            (raw, {**rendered, "改进": r"\<p><br />1. keep <literal><br />\</p>"}),
+            (raw, {**rendered, "改进": "<p>\n  2. keep <literal>\n</p>"}),
+            ({**raw, "改进": "2. keep <literal>"}, rendered),
+            ({k: v for k, v in raw.items() if k != "收获"}, rendered),
+            ({**raw, "改进": []}, rendered),
+            (raw, {**rendered, "收获": None}),
+        ):
+            with self.subTest(row=row, props=props):
+                result = run(row, props)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_b19_verified_escaped_display_is_accepted(self):
+        helper = ORGANIZE_REFERENCE.parent.parent / "scripts" / "organize_body.py"
+        row = {"Name": "Example", "收获": "", "改进": "1. keep <literal>"}
+        rendered = {**row, "改进": r"1\. keep <literal>"}
+        result = subprocess.run(
+            [sys.executable, "-B", str(helper)],
+            input=json.dumps({"fields": list(row), "row": row, "properties": rendered}),
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), row)
 
     def test_uses_one_bounded_parameterized_query(self):
         self.assertEqual(1, self.real_read.count("SELECT url, createdTime"))

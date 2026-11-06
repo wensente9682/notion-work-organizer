@@ -255,12 +255,44 @@ For real-mode connector candidate reads, use this narrow mixed read path:
    `createdTime` from the collection query as `added`. Stop the whole preview
    if a candidate page or required related category page cannot be resolved, or
    if the candidate page omits `page_last_edited_at`.
-4. Apply the remaining existing candidate eligibility rules locally, including
+4. Before eligibility, display or snapshot, take `Name`, `收获` and `改进`
+   from the configured structured SQL columns. Verify the SQL row and fetched
+   page identify the same row in the configured data source. Parse the fetched
+   page's `<properties>` JSON for corroboration and call
+   `python3 -B <this-skill-directory>/scripts/organize_body.py` with JSON on
+   stdin: `fields` (the three configured names in that order), `row` (the SQL
+   record), and `properties` (the parsed property object). Use only the helper's
+   stdout fields as the candidate body. An explicit SQL null in a rich-text
+   column represents empty only when the fetched value corroborates it. Stop
+   on nonzero exit, missing fields, truncated evidence, an ambiguous identity,
+   or an unsupported rendering. A verified Markdown-escaped display may differ
+   from the SQL text, including escaped punctuation; literal tags written into
+   the property remain distinct content. Do not strip tags from the page Markdown or
+   turn a missing value into an empty cleanup candidate.
+5. Apply the remaining existing candidate eligibility rules locally, including
    pending cleanup for checked rows with empty takeaway and improvement. Do
    this only after Category facts are resolved; preserve ascending `createdTime`
    order, then apply the configured `batch_size`.
-5. Render the existing read-only candidate preview with the returned task,
+6. Render the existing read-only candidate preview with the validated task,
    category, takeaway, improvement, page identity/URL, and system times.
+
+Use this body gate again for real-mode `ok`, `dismiss`, and `confirm`.
+Re-read the exact source row with a bounded parameterized SQL query and
+fetch the same page. Bind the SQL-returned URL for exact lookups (the fetch
+URL may have a different host). For old records without it, bound the query
+by the fetched title and require a complete, unambiguous match by page
+identity. Recheck completion and category separately. A legacy displayed
+snapshot or old dismissal fingerprint needs a new preview and decision
+when it cannot verify against the canonical body. Never rewrite the old
+fingerprint to make it pass.
+Compute the content fingerprint from the validated body and resolved
+category with exact title and body text after the established outer whitespace
+trim. Older fingerprints that folded arrow characters need a fresh preview and
+approval before use. A new dismissal records `fingerprint_version: 2`;
+without a matching trusted snapshot, older unversioned dismissal records cannot
+be verified for final removal and require a new reviewed dismissal. With an available snapshot, also compare the two validated
+takeaway/improvement strings directly so a content edit cannot pass through
+fingerprint normalization alone.
 
 Do not use view mode for real candidate reads: it does not return the required
 `createdTime` and `lastEditedTime` fields. Do not use the CLI, token, or direct
@@ -351,6 +383,9 @@ On `ok N`:
    - `Name`
    - `收获`
    - `改进`
+   In real connector mode send the validated body fields, never the rendered
+   property strings or paragraph wrappers. Use the same body gate for any
+   real manual-match or archive readback.
 8. Do not copy `category`, `project-test`, or any source relation into the archive row.
 9. Record the created target URL in the response so `undo N` can reverse it.
 10. Record the move in local state. In test mode, also add a row to `todo-test organize ledger` with `session_id`, `operation_id`, action `moved`, stability `pending-removal`, batch number, item number, category, source URL, target URL, and a short note.
@@ -429,6 +464,13 @@ Do not combine final source removal with the last `ok` operation or with `done`.
 `remove-sources --confirm REMOVE_SOURCES` remains as a maintenance/retry command if `done` was interrupted or a historical ledger pending state needs cleanup. Normal use should not require the user to type it.
 
 Before final source removal, verify that moved/manual-match/dismissed source rows are present in local backup/state, then re-read each source row to confirm it is still in the source database and `完成` is still checked. For moved/manual-match rows, re-read the configured archive-table container, resolve the selected category's archive database, and confirm the current source `Name`, `收获`, and `改进` are saved in the selected archive database row. For dismissed rows, do not require an archive target; instead compare the current source row against the dismissed source fingerprint. In test mode, also verify the ledger for moved/manual-match rows. If backup/state evidence is missing or inconsistent, the source row is not checked complete, the target database row is missing, duplicated, or source content changed while pending, keep that row as `needs-review` and do not remove the source.
+
+In real connector mode, validate both sides of a moved pair with the body
+gate. SQL equality alone cannot prove the target is clean: SQL can flatten
+literal markup that was copied into the target property. For a dismissal,
+recompute the fingerprint from the freshly validated body and routing
+category. The connector body gate never replaces the final scope checks or
+the separately approved `done` → `confirm` list.
 
 When final source removal succeeds, update local state. In test mode, update the matching ledger rows from `pending-removal` to `removed`. If source removal is not performed, keep the row as `pending-removal`.
 
