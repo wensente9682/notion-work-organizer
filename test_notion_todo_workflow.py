@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -2920,6 +2921,176 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(len(updated["moved"]), 1)
         self.assertEqual(len(updated["needs_review"]), 1)
 
+    def test_confirm_reports_mixed_result_without_completion_claim(self):
+        second_id = "SECOND_PAGE"
+        good = dismissed_record(SOURCE_ID)
+        bad = dismissed_record(second_id)
+
+        class MixedClient(FakeClient):
+            def retrieve_page(self, page_id):
+                if workflow.notion_id(page_id) == second_id:
+                    changed = page(second_id, SOURCE_DB)
+                    changed["properties"]["Name"]["title"][0]["plain_text"] = "changed item"
+                    return changed
+                return super().retrieve_page(page_id)
+
+        client = MixedClient([])
+        state = {"dismissed": [good, bad], "awaiting_done_confirm": True}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            updated = self.run_with_files(client, state, workflow.command_confirm)
+        text = output.getvalue()
+        self.assertEqual(client.archive_calls, [SOURCE_ID])
+        self.assertEqual([r["source_page_id"] for r in updated["removed"]], [SOURCE_ID])
+        self.assertEqual([r["source_page_id"] for r in updated["dismissed"]], [second_id])
+        self.assertTrue(updated["awaiting_done_confirm"])
+        self.assertNotIn("confirmed", text)
+        self.assertIn("finalized removals:", text)
+        self.assertIn("changed after dismissal", text)
+        self.assertIn("pending rows still need review", text)
+
+    def test_confirm_keeps_review_only_state_open_without_success_word(self):
+        client = FakeClient([])
+        review = {"operation_id": "old-op", "needs_review": "source changed"}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            updated = self.run_with_files(
+                client, {"needs_review": [review], "awaiting_done_confirm": True}, workflow.command_confirm
+            )
+        self.assertEqual(client.archive_calls, [])
+        self.assertTrue(updated["awaiting_done_confirm"])
+        self.assertEqual(updated["needs_review"], [review])
+        self.assertNotIn("confirmed", output.getvalue())
+        self.assertIn("source changed", output.getvalue())
+
+    def test_confirm_review_only_does_not_open_notion_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            self.write_json(config_path, config())
+            self.write_json(state_path, {"needs_review": [{"needs_review": "source changed"}], "awaiting_done_confirm": True})
+            output = io.StringIO()
+            with patch.object(workflow, "get_client") as get_client, contextlib.redirect_stdout(output):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            get_client.assert_not_called()
+            self.assertTrue(workflow.load_json(state_path, {})["awaiting_done_confirm"])
+            self.assertIn("source changed", output.getvalue())
+
+    def test_confirm_saves_first_removal_when_second_archive_result_is_unknown(self):
+        second_id = "SECOND_PAGE"
+        first = dismissed_record(SOURCE_ID)
+        second = dict(dismissed_record(second_id), operation_id="dismiss-op-2")
+
+        class UncertainArchiveClient(FakeClient):
+            def __init__(self):
+                super().__init__([])
+                self.read_after_failure = []
+                self.failed_archive = False
+
+            def archive_page(self, page_id):
+                self.archive_calls.append(page_id)
+                if page_id == second_id:
+                    self.failed_archive = True
+                    raise workflow.WorkflowError("connection dropped")
+                return {"id": page_id}
+
+            def retrieve_page(self, page_id):
+                if page_id == second_id and self.failed_archive:
+                    self.read_after_failure.append(page_id)
+                return page(page_id, SOURCE_DB)
+
+        client = UncertainArchiveClient()
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            self.write_json(config_path, config())
+            self.write_json(state_path, {"dismissed": [first, second], "awaiting_done_confirm": True})
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "backup_record") as backup,
+                contextlib.redirect_stdout(output),
+            ):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+                updated = workflow.load_json(state_path, {})
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+        self.assertEqual(client.archive_calls, [SOURCE_ID, second_id])
+        self.assertEqual(client.read_after_failure, [second_id])
+        self.assertEqual(backup.call_count, 1)
+        self.assertEqual(backup.call_args.args[1]["source_page_id"], SOURCE_ID)
+        self.assertEqual(backup.call_args.args[1]["action"], "removed")
+        self.assertEqual([row["source_page_id"] for row in updated["removed"]], [SOURCE_ID])
+        self.assertEqual([row["source_page_id"] for row in updated["dismissed"]], [second_id])
+        self.assertTrue(updated["awaiting_done_confirm"])
+        self.assertTrue(updated["dismissed"][0]["archive_outcome_uncertain"])
+        self.assertIn("connection dropped", updated["needs_review"][0]["needs_review"])
+        self.assertIn("finalized removals:", output.getvalue())
+        self.assertNotIn("confirmed", output.getvalue())
+
+    def test_confirm_closes_after_real_http_disconnect_on_second_archive(self):
+        second_id = "SECOND_PAGE"
+
+        class HttpArchiveClient(workflow.NotionClient):
+            def __init__(self, cache_path):
+                super().__init__("test-token", "bottom_first", cache_path)
+                self.archive_calls = []
+                self.source_reads = []
+
+            def retrieve_page(self, page_id):
+                self.source_reads.append(page_id)
+                return page(page_id, SOURCE_DB)
+
+            def archive_page(self, page_id):
+                self.archive_calls.append(page_id)
+                return super().archive_page(page_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            self.write_json(config_path, config())
+            self.write_json(state_path, {
+                "dismissed": [dismissed_record(SOURCE_ID), dict(dismissed_record(second_id), operation_id="dismiss-op-2")],
+                "awaiting_done_confirm": True,
+            })
+            client = HttpArchiveClient(root / "cache.json")
+            output = io.StringIO()
+            with (
+                patch.object(workflow, "get_client", return_value=client),
+                patch.object(workflow, "backup_record") as backup,
+                patch.object(workflow.urllib.request, "urlopen", side_effect=[
+                    io.BytesIO(b'{"id":"SRC_PAGE"}'), http.client.RemoteDisconnected("connection closed")
+                ]) as urlopen,
+                contextlib.redirect_stdout(output),
+            ):
+                workflow.command_confirm(argparse.Namespace(config=config_path, state=state_path))
+            updated = workflow.load_json(state_path, {})
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(client.archive_calls, [SOURCE_ID, second_id])
+        self.assertEqual(client.source_reads.count(second_id), 2)
+        self.assertEqual(backup.call_count, 1)
+        self.assertEqual([row["source_page_id"] for row in updated["removed"]], [SOURCE_ID])
+        self.assertEqual([row["source_page_id"] for row in updated["dismissed"]], [second_id])
+        self.assertTrue(updated["awaiting_done_confirm"])
+        self.assertTrue(updated["needs_review"][0]["archive_outcome_uncertain"])
+        self.assertIn("connection closed", updated["needs_review"][0]["needs_review"])
+        self.assertNotIn("confirmed", output.getvalue())
+
+    def test_confirm_reports_success_only_after_all_pending_and_review_clear(self):
+        client = FakeClient([])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            updated = self.run_with_files(
+                client, {"dismissed": [dismissed_record()], "awaiting_done_confirm": True}, workflow.command_confirm
+            )
+        self.assertEqual(client.archive_calls, [SOURCE_ID])
+        self.assertFalse(updated["awaiting_done_confirm"])
+        self.assertEqual(updated.get("needs_review", []), [])
+        self.assertIn("confirmed", output.getvalue())
+
     def test_status_shows_done_confirmation_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
@@ -3398,6 +3569,34 @@ class DestructiveActionLedgerValidationTest(unittest.TestCase):
         self.assertEqual(client.ledger_updates, [("ledger-page-id", "removed")])
         self.assertEqual(len(updated["removed"]), 1)
         self.assertEqual(updated["removed"][0]["source_page_id"], SOURCE_ID)
+
+    def test_remove_sources_read_only_checks_prior_uncertain_ledger_operation(self):
+        class TrackingClient(FakeClient):
+            def __init__(self):
+                super().__init__([ledger_page()])
+                self.source_reads = []
+
+            def retrieve_page(self, page_id):
+                if page_id == SOURCE_ID:
+                    self.source_reads.append(page_id)
+                return super().retrieve_page(page_id)
+
+        client = TrackingClient()
+        state = {
+            "moved": [],
+            "needs_review": [{
+                "operation_id": "op-1", "source_page_id": SOURCE_ID,
+                "archive_outcome_uncertain": True, "needs_review": "previous archive result unknown",
+            }],
+        }
+        updated = self.run_with_files(client, state, workflow.command_remove_sources)
+
+        self.assertEqual(client.archive_calls, [])
+        self.assertEqual(client.ledger_updates, [])
+        self.assertGreaterEqual(len(client.source_reads), 2)
+        self.assertEqual(updated.get("removed"), [])
+        self.assertTrue(updated["needs_review"][0]["archive_outcome_uncertain"])
+        self.assertIn("archived=false", updated["needs_review"][0]["needs_review"])
 
     def test_remove_sources_does_not_finalize_unchecked_ledger_pending(self):
         class UncheckedPendingClient(FakeClient):

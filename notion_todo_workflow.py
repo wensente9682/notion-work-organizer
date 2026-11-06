@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -259,7 +260,7 @@ class NotionClient:
             if exc.code == 429:
                 record_rate_limit(self.cache_path, detail, path, mode="api")
             raise WorkflowError(f"Notion API error {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as exc:
             raise WorkflowError(f"Network error calling Notion: {exc}") from exc
 
     def query_database(self, database_id: str, start_cursor: str | None = None, page_size: int = 100) -> dict[str, Any]:
@@ -3308,13 +3309,24 @@ def command_confirm(args: argparse.Namespace) -> None:
     if not state.get("awaiting_done_confirm"):
         print("No done confirmation is waiting.")
         return
-    removed = finalize_source_removal(config, state, args.state)
+    if state.get("needs_review") and not any(
+        state.get(bucket) for bucket in ("moved", "manual_matches", "dismissed", "empty_cleanup")
+    ):
+        removed = []
+    else:
+        removed = finalize_source_removal(config, state, args.state)
     state = load_json(args.state, {"batch": [], "moved": [], "skipped": []})
-    state["awaiting_done_confirm"] = bool(state.get("moved") or state.get("manual_matches") or state.get("dismissed") or state.get("empty_cleanup"))
+    state["awaiting_done_confirm"] = bool(
+        state.get("moved") or state.get("manual_matches") or state.get("dismissed")
+        or state.get("empty_cleanup") or state.get("needs_review")
+    )
     save_json(args.state, state)
-    print("confirmed")
     if state["awaiting_done_confirm"]:
         print("pending rows still need review; fix them and run `confirm` again")
+        for record in state.get("needs_review", []):
+            print(f"  reason: {record.get('needs_review') or 'review required'}")
+    else:
+        print("confirmed")
     if removed:
         print("finalized removals:")
         for record in removed:
@@ -3365,16 +3377,42 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
     removed = []
     needs_review = []
     attempted_ops = {record.get("operation_id") for record in moved if record.get("operation_id")}
+    uncertain_ops = {
+        record.get("operation_id"): record
+        for record in state.get("needs_review", [])
+        if record.get("archive_outcome_uncertain") and record.get("operation_id")
+    }
     undone_ops = {record.get("operation_id") for record in state.get("undone", []) if record.get("operation_id")}
     undone_sources = {notion_id(record.get("source_page_id", "")) for record in state.get("undone", []) if record.get("source_page_id")}
     backed_up_operations, backed_up_skipped_operations = backed_up_operation_evidence(state_path.parent / "backups")
-    for record in moved:
+    remaining_by_bucket = {
+        "moved": remaining_moved,
+        "manual_matches": remaining_manual_matches,
+        "dismissed": remaining_dismissed,
+        "empty_cleanup": remaining_empty_cleanup,
+    }
+    for index, record in enumerate(moved):
         source_page_id = record.get("source_page_id")
         if not source_page_id:
             needs_review.append(dict(record, reason="missing source page id"))
             continue
         source_compact = notion_id(source_page_id)
         kept = {key: value for key, value in record.items() if key != "_state_bucket"}
+        prior_uncertain = uncertain_ops.get(record.get("operation_id")) if record.get("_state_bucket") == "_ledger" else None
+        if record.get("archive_outcome_uncertain") or prior_uncertain:
+            if prior_uncertain:
+                try:
+                    archived = client.retrieve_page(source_page_id).get("archived")
+                    check = f"read-only source archived={str(archived).lower()}"
+                except WorkflowError as read_exc:
+                    check = f"read-only source check failed: {read_exc}"
+                kept["archive_outcome_uncertain"] = True
+                kept["needs_review"] = f"{prior_uncertain.get('needs_review') or 'Source archive result uncertain'}; {check}. Review before retrying."
+            needs_review.append(kept)
+            remaining_by_bucket.get(record.get("_state_bucket"), []).append(kept)
+            print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
+            print(f"  reason: {kept.get('needs_review') or 'Source archive result uncertain; review before retrying.'}")
+            continue
         if record.get("operation_id") in undone_ops or source_compact in undone_sources:
             kept["needs_review"] = "Final source removal stopped: this record was undone."
             needs_review.append(kept)
@@ -3455,7 +3493,27 @@ def finalize_source_removal(config: dict[str, Any], state: dict[str, Any], state
             print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
             print(f"  reason: {exc}")
             continue
-        client.archive_page(source_page_id)
+        try:
+            client.archive_page(source_page_id)
+        except WorkflowError as exc:
+            try:
+                archived = client.retrieve_page(source_page_id).get("archived")
+                check = f"read-only source archived={str(archived).lower()}"
+            except WorkflowError as read_exc:
+                check = f"read-only source check failed: {read_exc}"
+            reason = f"Source archive result uncertain: {exc}; {check}. Review before retrying."
+            kept["needs_review"] = reason
+            kept["archive_outcome_uncertain"] = True
+            needs_review.append(kept)
+            remaining_by_bucket.get(record.get("_state_bucket"), []).append(kept)
+            for pending in moved[index + 1:]:
+                bucket = pending.get("_state_bucket")
+                remaining_by_bucket.get(bucket, []).append(
+                    {key: value for key, value in pending.items() if key != "_state_bucket"}
+                )
+            print(f"needs review before source removal: {record.get('source_url') or source_page_id}")
+            print(f"  reason: {reason}")
+            break
         if config_mode(config) != REAL_MODE and ledger_move.page_id:
             client.update_ledger_stability(ledger_move.page_id, "removed")
         backup_record(

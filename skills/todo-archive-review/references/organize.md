@@ -459,6 +459,8 @@ When the workflow reaches 30 successful moved rows, no more eligible candidates,
 5. Ask: “Confirm today's changes?” The user may reply `confirm`.
 6. On `confirm`, finalize checked pending source rows. The user should not need to type `remove-sources --confirm REMOVE_SOURCES`.
 
+For daily Connector confirmation, say `confirmed` only when every pending source removal succeeds and no `needs-review` row remains. For partial success, list the source rows actually removed, keep the others pending with their concrete review reasons, and say confirmation is still waiting. For zero success, report the pending rows and reasons without a completion claim. If only `needs-review` rows remain locally, show their stored reasons without making another Connector query. When an archive call's result is uncertain, check the source read-only, preserve known successful removals in local state and backup, and require review before any retry.
+
 Do not combine final source removal with the last `ok` operation or with `done`. Final source removal happens only after the user sees the done summary and confirms.
 
 `remove-sources --confirm REMOVE_SOURCES` remains as a maintenance/retry command if `done` was interrupted or a historical ledger pending state needs cleanup. Normal use should not require the user to type it.
