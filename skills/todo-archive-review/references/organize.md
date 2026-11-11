@@ -360,12 +360,14 @@ Then remind:
 Reply: ok 1 3 | dismiss 2 | skip 4 | next | save | done | stop
 ```
 
-After a batch operation, provide a compact operation summary:
+After each successful `ok` or `dismiss`, show a compact receipt. Before `next` / `done`, list every undoable item from the current batch by its batch number: only archive copies actually created by this workflow and dismissals still pending locally. Exclude `manual-match` and already-undone items; omit either undo line when it has no items. For `skip`, keep the `Skipped: N` summary without an undo line. For example, after batch 25 has four created archive copies and one dismissal:
 
 ```text
-Moved: 1, 3
-Skipped: 2
-Undo available: undo 1 | undo 3
+Batch 25
+Moved: 1, 2, 3, 4
+Dismissed: 5
+撤回本流程创建的归档副本: undo 1 | undo 2 | undo 3 | undo 4
+取消 dismiss: undo 5
 Next: say next, save, or done to finish early
 ```
 
